@@ -764,7 +764,7 @@ class MainActivity : Activity() {
         val v = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/UHDRCam")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
         }
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: return
         contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
