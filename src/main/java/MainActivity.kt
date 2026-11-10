@@ -91,6 +91,12 @@ class MainActivity : Activity() {
     private var vendorKeys: Set<String> = emptySet()
     private var vendorLog = ""
     private var suppress = false
+
+    // Opción experimental recién activada: si la cámara se cae antes de estabilizarse, se revierte
+    private var riskySwitch: Switch? = null
+    private var riskyName = ""
+    private var riskyRevert: (() -> Unit)? = null
+    @Volatile private var okFrames = 0
     private val profiles = mutableMapOf<Lens, Profile>()
 
     private val camThread = HandlerThread("cam").apply { start() }
@@ -268,9 +274,16 @@ class MainActivity : Activity() {
         fun vendorSwitch(t: String, onSet: (Boolean) -> Unit) = root.addView(Switch(this).apply {
             text = t
             setPadding(24, 8, 24, 8)
-            setOnCheckedChangeListener { _, checked ->
+            setOnCheckedChangeListener { sw, checked ->
+                if (suppress) return@setOnCheckedChangeListener
                 onSet(checked)
-                if (device != null) startSession()
+                if (checked) {
+                    riskySwitch = sw as Switch
+                    riskyName = t
+                    riskyRevert = { onSet(false) }
+                    okFrames = 0
+                }
+                if (device != null) startSession() else openCamera()
             }
         })
         vendorSwitch("MFNR: ruido multi-frame") { vMfnr = it }
@@ -358,7 +371,20 @@ class MainActivity : Activity() {
                 override fun onOpened(d: CameraDevice) { device = d; startSession() }
                 override fun onDisconnected(d: CameraDevice) { d.close(); device = null }
                 override fun onError(d: CameraDevice, error: Int) {
-                    d.close(); device = null; say("Error de cámara: $error")
+                    d.close(); device = null; session = null
+                    val sw = riskySwitch
+                    if (sw != null) {
+                        riskyRevert?.invoke()
+                        riskySwitch = null; riskyRevert = null
+                        val n = riskyName
+                        runOnUiThread {
+                            suppress = true; sw.isChecked = false; suppress = false
+                            status.text = "\"$n\" hizo caer la cámara (error $error). Lo desactivé y reabro."
+                            texture.postDelayed({ openCamera() }, 800)
+                        }
+                    } else {
+                        say("Error de cámara: $error")
+                    }
                 }
             }, camHandler)
         } catch (e: Exception) {
@@ -451,6 +477,8 @@ class MainActivity : Activity() {
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
             res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastT = it }
             res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
+            // Tras 30 frames sanos, la opción experimental se considera estable
+            if (riskySwitch != null && ++okFrames >= 30) { riskySwitch = null; riskyRevert = null }
         }
     }
 
