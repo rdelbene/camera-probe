@@ -3,8 +3,6 @@ package com.example.uhdrcam
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.SharedPreferences
@@ -43,7 +41,6 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
-import android.widget.Toast
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
@@ -84,8 +81,15 @@ class MainActivity : Activity() {
 
     private var lens = Lens.MAIN
     private var physicalMode = false
-    private var sceneHdr = false
+    private var burstN = 3
     private var fusionMode = false
+    private var vMfnr = false
+    private var vMfhdr = false
+    private var vShdr = false
+    private var vZsl = false
+    private var vMoto = false
+    private var vendorKeys: Set<String> = emptySet()
+    private var vendorLog = ""
     private var suppress = false
     private val profiles = mutableMapOf<Lens, Profile>()
 
@@ -100,7 +104,6 @@ class MainActivity : Activity() {
     private var sensorOrientation = 90
 
     // Capacidades del lente activo
-    private var sceneHdrSupported = false
     private var expMin = 1_000L
     private var expMax = 1_000_000_000L
     private var isoMin = 50
@@ -115,8 +118,9 @@ class MainActivity : Activity() {
 
     // Estado de la fusión
     private val fuseLock = Any()
-    private val fuseImgs = arrayOfNulls<ByteArray>(3)
-    private val fuseP = DoubleArray(3)
+    private val fuseImgs = arrayOfNulls<ByteArray>(5)
+    private val fuseP = DoubleArray(5)
+    private var fuseTotal = 3
     private var fuseImgCount = 0
     private var fuseResCount = 0
 
@@ -248,7 +252,7 @@ class MainActivity : Activity() {
 
         // Modos de captura
         root.addView(Switch(this).apply {
-            text = "Fusión HDR por ráfaga (3 fotos)"
+            text = "Fusión HDR por ráfaga"
             setPadding(24, 12, 24, 8)
             setOnCheckedChangeListener { _, checked ->
                 fusionMode = checked
@@ -256,14 +260,25 @@ class MainActivity : Activity() {
             }
         })
         root.addView(Switch(this).apply {
-            text = "Escena HDR del fabricante (si existe)"
+            text = "Ráfaga de 5 fotos (más suave, tarda más)"
+            setPadding(24, 8, 24, 8)
+            setOnCheckedChangeListener { _, checked -> burstN = if (checked) 5 else 3 }
+        })
+        root.addView(label("Motor propio Qualcomm / Motorola (experimental)"))
+        fun vendorSwitch(t: String, onSet: (Boolean) -> Unit) = root.addView(Switch(this).apply {
+            text = t
             setPadding(24, 8, 24, 8)
             setOnCheckedChangeListener { _, checked ->
-                sceneHdr = checked
-                if (checked && !sceneHdrSupported) say("Este lente no declara escena HDR")
-                updatePreview()
+                onSet(checked)
+                if (device != null) startSession()
             }
         })
+        vendorSwitch("MFNR: ruido multi-frame") { vMfnr = it }
+        vendorSwitch("MFHDR: HDR multi-frame") { vMfhdr = it }
+        vendorSwitch("SHDR: HDR escalonado") { vShdr = it }
+        vendorSwitch("ZSL de Motorola") { vZsl = it }
+        vendorSwitch("Marcar cliente como Moto Camera") { vMoto = it }
+
         root.addView(Switch(this).apply {
             text = "Lente físico directo (experimental)"
             setPadding(24, 8, 24, 8)
@@ -302,11 +317,6 @@ class MainActivity : Activity() {
         }
         root.addView(hdrBar)
 
-        root.addView(Button(this).apply {
-            text = "Info del celu (copia al portapapeles)"
-            setOnClickListener { showInfo() }
-        })
-
         setContentView(ScrollView(this).apply { addView(root) })
         refreshControls()
     }
@@ -330,40 +340,6 @@ class MainActivity : Activity() {
     }
 
     private fun say(msg: String) = runOnUiThread { status.text = msg }
-
-    // ------------------------------------------------------------------ info del equipo
-
-    private fun showInfo() {
-        val text = try { infoReport() } catch (e: Exception) { "Error: $e" }
-        status.text = text
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("info", text))
-        Toast.makeText(this, "Copiado", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun infoReport(): String {
-        val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val c = mgr.getCameraCharacteristics("0")
-        val sb = StringBuilder()
-        sb.appendLine("Scene modes: ${c.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)?.toList()} (HDR=18)")
-        sb.appendLine("Exposición ns: ${c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)} | ISO: ${c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)}")
-        try {
-            val ext = mgr.getCameraExtensionCharacteristics("0")
-            val names = mapOf(0 to "AUTO", 1 to "FACE_RETOUCH", 2 to "BOKEH", 3 to "HDR", 4 to "NIGHT")
-            val sup = ext.supportedExtensions
-            sb.appendLine("Extensiones: ${sup.map { names[it] ?: it.toString() }}")
-            sup.forEach { e ->
-                sb.appendLine("  ${names[e] ?: e}: JPEG ${ext.getExtensionSupportedSizes(e, ImageFormat.JPEG).take(2)}")
-            }
-        } catch (e: Exception) {
-            sb.appendLine("Extensiones: error ${e.javaClass.simpleName}")
-        }
-        val vendorReq = c.availableCaptureRequestKeys.map { it.name }.filter { !it.startsWith("android.") }
-        val vendorRes = c.availableCaptureResultKeys.map { it.name }.filter { !it.startsWith("android.") }
-        sb.appendLine("Claves propias (request): $vendorReq")
-        sb.appendLine("Claves propias (result): $vendorRes")
-        return sb.toString()
-    }
 
     // ------------------------------------------------------------------ cámara
 
@@ -410,8 +386,7 @@ class MainActivity : Activity() {
             val chars = mgr.getCameraCharacteristics(if (physicalMode) lens.physicalId else "0")
             val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
 
-            sceneHdrSupported = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)
-                ?.contains(CameraMetadata.CONTROL_SCENE_MODE_HDR) == true
+            vendorKeys = chars.availableCaptureRequestKeys.map { it.name }.toSet()
             chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { expMin = it.lower; expMax = it.upper }
             chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { isoMin = it.lower; isoMax = it.upper }
 
@@ -428,7 +403,7 @@ class MainActivity : Activity() {
             val pSurface = Surface(st)
             previewSurface = pSurface
 
-            val r = ImageReader.newInstance(stillSize.width, stillSize.height, stillFormat, if (fusionMode) 4 else 2)
+            val r = ImageReader.newInstance(stillSize.width, stillSize.height, stillFormat, if (fusionMode) 7 else 2)
             r.setOnImageAvailableListener({ rd -> if (fusionMode) onFusionImage(rd) else onPhoto(rd) }, camHandler)
             reader = r
 
@@ -449,6 +424,9 @@ class MainActivity : Activity() {
                     }
                 }
             )
+            val sp = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            applyVendor(sp)
+            cfg.setSessionParameters(sp.build())
             d.createCaptureSession(cfg)
         } catch (e: Exception) {
             say("Sesión: ${e.javaClass.simpleName} ${e.message}")
@@ -459,17 +437,13 @@ class MainActivity : Activity() {
         val b = device!!.createCaptureRequest(template)
         val p = prof()
         b.addTarget(target)
-        if (sceneHdr && sceneHdrSupported && allowScene) {
-            b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_USE_SCENE_MODE)
-            b.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_HDR)
-        } else {
-            b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-        }
+        b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
         b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, p.exp)
         if (p.nr > 0) b.set(CaptureRequest.NOISE_REDUCTION_MODE, p.nr - 1)
         if (p.edge > 0) b.set(CaptureRequest.EDGE_MODE, p.edge - 1)
         b.set(CaptureRequest.CONTROL_ZOOM_RATIO, if (physicalMode) 1f else lens.zoom)
+        applyVendor(b)
         return b
     }
 
@@ -487,10 +461,35 @@ class MainActivity : Activity() {
             val req = buildRequest(CameraDevice.TEMPLATE_PREVIEW, surf, !fusionMode).build()
             s.setRepeatingRequest(req, previewCb, camHandler)
             say("${lens.label} · ${if (physicalMode) "físico ${lens.physicalId}" else "lógico"}" +
-                if (fusionMode) " · fusión" else "")
+                (if (fusionMode) " · fusión" else "") + vendorLog)
         } catch (e: Exception) {
             say("Preview: ${e.javaClass.simpleName} ${e.message}")
         }
+    }
+
+    // ------------------------------------------------------------------ claves propias
+
+    private fun setVendor(b: CaptureRequest.Builder, name: String, v: Int): String {
+        if (name !in vendorKeys) return "no existe"
+        try { b.set(CaptureRequest.Key<Byte>(name, Byte::class.javaObjectType), v.toByte()); return "ok(byte)" } catch (_: Exception) {}
+        try { b.set(CaptureRequest.Key<Int>(name, Int::class.javaObjectType), v); return "ok(int)" } catch (_: Exception) {}
+        try { b.set(CaptureRequest.Key<IntArray>(name, IntArray::class.java), intArrayOf(v)); return "ok(int[])" } catch (_: Exception) {}
+        return "tipo no compatible"
+    }
+
+    private fun applyVendor(b: CaptureRequest.Builder) {
+        val q = "org.codeaurora.qcamera3.sessionParameters."
+        val m = "com.lenovo.moto."
+        val log = StringBuilder()
+        fun go(on: Boolean, label: String, key: String) {
+            if (on) log.append("\n$label: ${setVendor(b, key, 1)}")
+        }
+        go(vMfnr, "MFNR", q + "enableMFNR")
+        go(vMfhdr, "MFHDR", q + "EnableMFHDR")
+        go(vShdr, "SHDR", q + "EnableSHDR")
+        go(vZsl, "ZSL Moto", m + "control.capture_zsl_mode")
+        go(vMoto, "Cliente Moto", m + "clientapp.is_motcamera2")
+        vendorLog = log.toString()
     }
 
     // ------------------------------------------------------------------ captura simple (JPEG_R)
@@ -580,12 +579,13 @@ class MainActivity : Activity() {
         try {
             synchronized(fuseLock) {
                 fuseImgCount = 0; fuseResCount = 0
-                for (i in 0..2) { fuseImgs[i] = null; fuseP[i] = 0.0 }
+                for (i in 0..4) { fuseImgs[i] = null; fuseP[i] = 0.0 }
+                fuseTotal = burstN
             }
             pendingLens = lens
             pendingHdr = prof().hdr
 
-            val evs = floatArrayOf(0f, -2f, -4f)
+            val evs = if (burstN == 5) floatArrayOf(0f, -1f, -2f, -3f, -4f) else floatArrayOf(0f, -2f, -4f)
             val reqs = evs.mapIndexed { i, ev ->
                 val targetP = t0.toDouble() * iso0 * 2.0.pow(ev.toDouble())
                 val t = (targetP / iso0).toLong().coerceIn(expMin, expMax)
@@ -631,7 +631,7 @@ class MainActivity : Activity() {
             img.close()
         }
         synchronized(fuseLock) {
-            if (fuseImgCount < 3) {
+            if (fuseImgCount < fuseTotal) {
                 fuseImgs[fuseImgCount] = bytes
                 fuseImgCount++
             }
@@ -639,11 +639,12 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Se llama con fuseLock tomado. Cuando están los 3 frames y los 3 resultados, procesa en otro hilo. */
+    /** Se llama con fuseLock tomado. Cuando están todos los frames y todos los resultados, procesa en otro hilo. */
     private fun maybeFuse() {
-        if (fuseImgCount < 3 || fuseResCount < 3) return
-        val frames = Array(3) { fuseImgs[it]!! }
-        val p = fuseP.copyOf()
+        if (fuseImgCount < fuseTotal || fuseResCount < fuseTotal) return
+        val n = fuseTotal
+        val frames = Array(n) { fuseImgs[it]!! }
+        val p = fuseP.copyOf(n)
         val tag = pendingLens.name
         val hdr = pendingHdr
         fuseImgCount = 0
@@ -683,16 +684,17 @@ class MainActivity : Activity() {
         val th = luma.map { median(it.code) }
         val bits = luma.mapIndexed { i, l -> mtb(l.code, th[i]) }
         val mask = luma.mapIndexed { i, l -> mtbMask(l.code, th[i]) }
-        val dx = IntArray(3)
-        val dy = IntArray(3)
-        for (f in 1..2) {
+        val nf = frames.size
+        val dx = IntArray(nf)
+        val dy = IntArray(nf)
+        for (f in 1 until nf) {
             val s = estimateShift(bits[0], mask[0], bits[f], mask[f], w, h)
             dx[f] = s[0]; dy[f] = s[1]
         }
 
         // 3) Fusión de radiancia y gain map (en log2)
         val eps = 1f / 64f
-        val e = DoubleArray(3) { p[it] / p[0] }
+        val e = DoubleArray(nf) { p[it] / p[0] }
         val n = w * h
         val lg = FloatArray(n)
         for (y in 0 until h) {
@@ -700,7 +702,7 @@ class MainActivity : Activity() {
                 val i = y * w + x
                 var num = 0.0
                 var den = 0.0
-                for (f in 0..2) {
+                for (f in 0 until nf) {
                     val xx = (x + dx[f]).coerceIn(0, w - 1)
                     val yy = (y + dy[f]).coerceIn(0, h - 1)
                     val j = yy * w + xx
