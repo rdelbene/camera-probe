@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,9 +23,26 @@ jobs:
           gradle-version: 8.9
 
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+        shell: bash
+        run: gradle assembleDebug --no-daemon 2>&1 | tee build.log
 
       - uses: actions/upload-artifact@v4
         with:
-          name: camera-probe-apk
+          name: uhdr-cam-apk
           path: build/outputs/apk/debug/*.apk
+
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" build/outputs/apk/debug/*.apk \
+            --title "UHDR Cam build ${{ github.run_number }}" --notes "APK debug"
+
+      - name: Publish build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tail -n 200 build.log > build-tail.log || echo "no log" > build-tail.log
+          gh release create "build-${{ github.run_number }}-failed" build-tail.log \
+            --title "FAILED build ${{ github.run_number }}" --notes "Build log"

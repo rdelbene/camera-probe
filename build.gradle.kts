@@ -4,12 +4,12 @@ plugins {
 }
 
 android {
-    namespace = "com.example.cameraprobe"
+    namespace = "com.example.uhdrcam"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.cameraprobe"
-        minSdk = 28
+        applicationId = "com.example.uhdrcam"
+        minSdk = 34
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
