@@ -6,6 +6,7 @@
 
     <application
         android:label="UHDR Cam"
+        android:largeHeap="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity
             android:name=".MainActivity"
