@@ -3,18 +3,23 @@ package com.example.uhdrcam
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Gainmap
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -35,18 +40,20 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Range
 import android.util.Size
 import android.view.GestureDetector
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
-import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
@@ -72,10 +79,18 @@ import kotlin.math.roundToInt
 
 /** Lentes del Edge 50 Ultra: fisicos 3 (UGA), 2 (principal), 5 (tele) dentro de la logica 0, y la frontal. */
 enum class Lens(val label: String, val zoom: Float, val physicalId: String, val front: Boolean = false) {
-    UGA("0.5x", 0.5f, "3"),
+    UGA("0.5", 0.5f, "3"),
     MAIN("1x", 1.0f, "2"),
-    TELE("3x", 3.0f, "5"),
+    TELE("3", 3.0f, "5"),
     FRONT("Frontal", 1.0f, "", true)
+}
+
+/** Modos del carrusel. FOTO = HDR activo (8 fotos), MEJORADO = 15 fotos, NOCHE = 10/15/20 fotos largas. */
+enum class Mode(val label: String) {
+    VIDEO("Video"),
+    FOTO("Foto"),
+    MEJORADO("Mejorado"),
+    NOCHE("Noche")
 }
 
 /**
@@ -85,41 +100,99 @@ enum class Lens(val label: String, val zoom: Float, val physicalId: String, val 
  */
 class Profile(var exp: Int = 0, var nr: Int = 0, var edge: Int = 0, var hdr: Int = 100)
 
+/** Cuadrícula de tercios sobre el visor. */
+class GridOverlay(ctx: Context) : View(ctx) {
+    private val paint = Paint().apply {
+        color = Color.argb(140, 255, 255, 255)
+        strokeWidth = ctx.resources.displayMetrics.density
+    }
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        for (i in 1..2) {
+            c.drawLine(w * i / 3, 0f, w * i / 3, h, paint)
+            c.drawLine(0f, h * i / 3, w, h * i / 3, paint)
+        }
+    }
+}
+
+private val SHUTTER_NS = longArrayOf(
+    0L, 1_000_000L, 2_000_000L, 4_000_000L, 8_000_000L, 16_666_667L, 33_333_333L,
+    66_666_667L, 125_000_000L, 250_000_000L, 500_000_000L, 1_000_000_000L
+)
+private val AWB_MODES = intArrayOf(
+    CameraMetadata.CONTROL_AWB_MODE_AUTO,
+    CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT,
+    CameraMetadata.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT,
+    CameraMetadata.CONTROL_AWB_MODE_INCANDESCENT,
+    CameraMetadata.CONTROL_AWB_MODE_FLUORESCENT
+)
+private val AWB_LABELS = arrayOf("AWB", "DÍA", "NUB", "INC", "FLU")
+private val AWB_NAMES = arrayOf("automático", "día", "nublado", "incandescente", "fluorescente")
+private val TIMERS = intArrayOf(0, 3, 10)
+
+private fun fmtT(ns: Long): String =
+    if (ns >= 1_000_000_000L) "%.0f s".format(ns / 1e9) else "1/${(1e9 / ns).roundToInt()} s"
+
+private val GREEN = Color.rgb(0, 224, 150)
+private val DARK = Color.argb(200, 40, 40, 40)
+
 class MainActivity : Activity() {
 
     // ------------------------------------------------------------------ interfaz
+    private lateinit var root: FrameLayout
     private lateinit var texture: TextureView
     private lateinit var previewFrame: FrameLayout
+    private lateinit var grid: GridOverlay
     private lateinit var focusRing: View
-    private lateinit var shutter: Button
-    private lateinit var status: TextView
-    private lateinit var expBar: SeekBar
-    private lateinit var expLabel: TextView
+    private lateinit var topBar: LinearLayout
+    private lateinit var msgView: TextView
+    private lateinit var infoPanel: TextView
+    private lateinit var recTimer: TextView
+    private lateinit var rightCol: LinearLayout
+    private lateinit var btnEv: TextView
+    private lateinit var btnHl: TextView
+    private lateinit var btnTime: TextView
+    private lateinit var sliderPanel: LinearLayout
+    private lateinit var sliderLabel: TextView
+    private lateinit var sliderBar: SeekBar
+    private lateinit var lensRow: LinearLayout
+    private lateinit var bottomArea: LinearLayout
+    private lateinit var modesRow: LinearLayout
+    private lateinit var thumb: ImageView
+    private lateinit var shutterInner: View
+    private lateinit var settingsSheet: FrameLayout
     private lateinit var nrGroup: RadioGroup
     private lateinit var edgeGroup: RadioGroup
     private lateinit var hdrBar: SeekBar
     private lateinit var hdrLabel: TextView
-    private lateinit var hlLabel: TextView
-    private lateinit var photoBox: LinearLayout
-    private lateinit var videoBox: LinearLayout
-    private lateinit var nightBox: LinearLayout
+    private lateinit var sheetLensLabel: TextView
     private lateinit var prefs: SharedPreferences
     private var suppress = false
+    private val main = Handler(Looper.getMainLooper())
+    private val hideMsg = Runnable { msgView.visibility = View.GONE }
 
-    // ------------------------------------------------------------------ modos
+    // ------------------------------------------------------------------ modos y ajustes
     private var lens = Lens.MAIN
-    private var videoMode = false
+    private var lastBackLens = Lens.MAIN
+    private var mode = Mode.FOTO
+    private val videoMode get() = mode == Mode.VIDEO
+    private val nightMode get() = mode == Mode.NOCHE
     private var physicalMode = false
-    /** Procesamiento HDR: 1 activo (fusión de 8), 2 mejorado (fusión de 15). */
-    private var hdrMode = 1
-    /** Formato de archivo Ultra HDR (JPEG con gain map). Independiente del procesamiento. */
+    /** Formato de archivo Ultra HDR (JPEG con gain map). */
     private var ultraHdr = true
-    private var nightMode = false
     private var nightFrames = 15
     /** Protección de luces altas en pasos de 1/3 EV (0..9). */
     private var hlSteps = 3
+    /** Índice en SHUTTER_NS; 0 = automático. */
+    private var shutterIdx = 0
+    private var awbIdx = 0
+    private var timerIdx = 0
+    private var gridOn = true
+    private var infoOn = false
     private var v4k = false
     private var v60 = false
+    private var activeSlider = 0 // 0 ninguno, 1 EV, 2 luces altas, 3 tiempo
 
     private var vMfnr = false
     private var vShdr = false
@@ -128,6 +201,8 @@ class MainActivity : Activity() {
     private var vendorKeys: Set<String> = emptySet()
     private var vendorLog = ""
     private var sessionNote = ""
+    private var lastNoteShown = ""
+    @Volatile private var lastShotInfo = "Todavía no sacaste ninguna foto"
     private val profiles = mutableMapOf<Lens, Profile>()
 
     private val camThread = HandlerThread("cam").apply { start() }
@@ -158,9 +233,14 @@ class MainActivity : Activity() {
     private var recPfd: ParcelFileDescriptor? = null
     private var recUri: Uri? = null
     @Volatile private var recording = false
+    private var recStart = 0L
     private var videoSize = Size(1920, 1080)
     private var videoFps = 30
     private var fpsRange = Range(30, 30)
+
+    // Galería
+    @Volatile private var lastUri: Uri? = null
+    @Volatile private var lastMime = "image/jpeg"
 
     // Foco por toque
     @Volatile private var focusRegion: MeteringRectangle? = null
@@ -175,9 +255,8 @@ class MainActivity : Activity() {
     private var riskyRevert: (() -> Unit)? = null
     @Volatile private var okFrames = 0
 
-    // Captura en curso
-    private var pendingLens = Lens.MAIN
     @Volatile private var merger: Merger? = null
+    private var countdown = 0
 
     // ------------------------------------------------------------------ ciclo de vida
 
@@ -192,10 +271,14 @@ class MainActivity : Activity() {
                 prefs.getInt("${l.name}_hdr2", 100)
             )
         }
-        hdrMode = prefs.getInt("hdrMode", 1).coerceIn(1, 2)
+        mode = Mode.values().getOrNull(prefs.getInt("mode2", Mode.FOTO.ordinal)) ?: Mode.FOTO
         ultraHdr = prefs.getBoolean("ultraHdr", true)
         nightFrames = prefs.getInt("nightFrames", 15).let { if (it in listOf(10, 15, 20)) it else 15 }
         hlSteps = prefs.getInt("hlSteps", 3).coerceIn(0, 9)
+        shutterIdx = prefs.getInt("shutterIdx", 0).coerceIn(0, SHUTTER_NS.size - 1)
+        awbIdx = prefs.getInt("awbIdx", 0).coerceIn(0, AWB_MODES.size - 1)
+        timerIdx = prefs.getInt("timerIdx", 0).coerceIn(0, TIMERS.size - 1)
+        gridOn = prefs.getBoolean("grid", true)
         v4k = prefs.getBoolean("v4k", false)
         v60 = prefs.getBoolean("v60", false)
 
@@ -207,6 +290,7 @@ class MainActivity : Activity() {
         } catch (_: Exception) { null }
 
         buildUi()
+        loadLastThumb()
     }
 
     override fun onResume() {
@@ -226,15 +310,24 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (settingsSheet.visibility == View.VISIBLE) { settingsSheet.visibility = View.GONE; return }
+        if (activeSlider != 0) { closeSlider(); return }
+        @Suppress("DEPRECATION")
+        super.onBackPressed()
+    }
+
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) openCamera()
         else say("Sin permiso de cámara")
     }
 
-    // ------------------------------------------------------------------ interfaz
+    // ------------------------------------------------------------------ utilidades de interfaz
 
     private fun prof() = profiles.getValue(lens)
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
 
     private fun save() {
         val e = prefs.edit()
@@ -242,24 +335,52 @@ class MainActivity : Activity() {
             e.putInt("${l.name}_exp", p.exp).putInt("${l.name}_nr2", p.nr)
                 .putInt("${l.name}_edge2", p.edge).putInt("${l.name}_hdr2", p.hdr)
         }
-        e.putInt("hdrMode", hdrMode).putBoolean("ultraHdr", ultraHdr).putInt("nightFrames", nightFrames)
-            .putInt("hlSteps", hlSteps).putBoolean("v4k", v4k).putBoolean("v60", v60)
+        e.putInt("mode2", mode.ordinal).putBoolean("ultraHdr", ultraHdr).putInt("nightFrames", nightFrames)
+            .putInt("hlSteps", hlSteps).putInt("shutterIdx", shutterIdx).putInt("awbIdx", awbIdx)
+            .putInt("timerIdx", timerIdx).putBoolean("grid", gridOn)
+            .putBoolean("v4k", v4k).putBoolean("v60", v60)
         e.apply()
     }
 
-    private fun label(text: String) = TextView(this).apply {
+    private fun oval(fill: Int, stroke: Int = 0, strokeColor: Int = 0) = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(fill)
+        if (stroke > 0) setStroke(stroke, strokeColor)
+    }
+
+    private fun pill(fill: Int) = GradientDrawable().apply {
+        cornerRadius = dp(28).toFloat()
+        setColor(fill)
+    }
+
+    private fun circleBtn(text: String, sizeDp: Int, onClick: () -> Unit) = TextView(this).apply {
+        this.text = text
+        gravity = Gravity.CENTER
+        setTextColor(Color.WHITE)
+        textSize = 12f
+        typeface = Typeface.DEFAULT_BOLD
+        background = oval(DARK)
+        setOnClickListener { onClick() }
+        layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+    }
+
+    private fun setOn(v: TextView, on: Boolean) {
+        v.background = oval(if (on) GREEN else DARK)
+        v.setTextColor(if (on) Color.BLACK else Color.WHITE)
+    }
+
+    private fun sheetLabel(text: String) = TextView(this).apply {
         this.text = text
         textSize = 14f
-        setPadding(24, 20, 24, 4)
+        setTextColor(Color.WHITE)
+        setPadding(dp(16), dp(16), dp(16), dp(4))
     }
 
     private fun seek(maxValue: Int, onChange: (Int) -> Unit) = SeekBar(this).apply {
         max = maxValue
-        setPadding(48, 8, 48, 8)
+        setPadding(dp(24), dp(6), dp(24), dp(6))
         setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
-                if (fromUser) onChange(p)
-            }
+            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { if (fromUser) onChange(p) }
             override fun onStartTrackingTouch(s: SeekBar) {}
             override fun onStopTrackingTouch(s: SeekBar) {}
         })
@@ -267,12 +388,13 @@ class MainActivity : Activity() {
 
     private fun radioRow(options: List<String>, selected: Int, onPick: (Int) -> Unit) = RadioGroup(this).apply {
         orientation = RadioGroup.HORIZONTAL
-        setPadding(24, 0, 24, 0)
+        setPadding(dp(12), 0, dp(12), 0)
         options.forEachIndexed { i, t ->
             addView(RadioButton(context).apply {
                 id = View.generateViewId()
                 text = t
                 tag = i
+                setTextColor(Color.WHITE)
             })
         }
         if (selected in options.indices) (getChildAt(selected) as RadioButton).isChecked = true
@@ -284,39 +406,33 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun switchRow(t: String, checked: Boolean, onSet: (Boolean) -> Unit) = Switch(this).apply {
-        text = t
-        isChecked = checked
-        setPadding(24, 12, 24, 8)
-        setOnCheckedChangeListener { _, c -> if (!suppress) onSet(c) }
-    }
-
+    private fun previewTop() = if (videoMode) 0 else dp(64)
     private fun previewHeight(): Int {
         val w = resources.displayMetrics.widthPixels
         return if (videoMode) w * 16 / 9 else w * 4 / 3
     }
 
-    private fun buildUi() {
-        val w = resources.displayMetrics.widthPixels
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, 64)
-        }
+    private fun LinearLayout.kids(): List<View> = (0 until childCount).map { getChildAt(it) }
 
-        // Visor + anillo de foco
-        texture = TextureView(this)
+    // ------------------------------------------------------------------ armado de la interfaz
+
+    private fun buildUi() {
+        val sw = resources.displayMetrics.widthPixels
+        root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+
+        // Visor
         previewFrame = FrameLayout(this)
+        texture = TextureView(this)
         previewFrame.addView(texture, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        val ringPx = (resources.displayMetrics.density * 64).toInt()
+        grid = GridOverlay(this).apply { visibility = if (gridOn) View.VISIBLE else View.GONE }
+        previewFrame.addView(grid, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         focusRing = View(this).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setStroke((resources.displayMetrics.density * 2).toInt(), Color.WHITE)
-            }
+            background = oval(Color.TRANSPARENT, dp(2), Color.WHITE)
             visibility = View.INVISIBLE
         }
-        previewFrame.addView(focusRing, FrameLayout.LayoutParams(ringPx, ringPx))
-        root.addView(previewFrame, LinearLayout.LayoutParams(w, previewHeight()))
+        previewFrame.addView(focusRing, FrameLayout.LayoutParams(dp(64), dp(64)))
+        root.addView(previewFrame, FrameLayout.LayoutParams(sw, previewHeight()).apply { topMargin = previewTop() })
+
         texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) { openCamera() }
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
@@ -326,104 +442,221 @@ class MainActivity : Activity() {
         val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent) = true
             override fun onSingleTapUp(e: MotionEvent): Boolean {
+                if (activeSlider != 0) { closeSlider(); return true }
                 focusAt(e.x, e.y, texture.width, texture.height); return true
             }
             override fun onLongPress(e: MotionEvent) { resetFocus(true) }
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                if (abs(vx) > abs(vy) * 1.5f && abs(vx) > 800f) {
+                    val next = mode.ordinal + if (vx < 0) 1 else -1
+                    Mode.values().getOrNull(next)?.let { setMode(it) }
+                    return true
+                }
+                return false
+            }
         })
         texture.setOnTouchListener { _, e -> gestures.onTouchEvent(e) }
 
-        shutter = Button(this).apply {
-            textSize = 18f
-            setOnClickListener { onShutter() }
+        // Barra superior
+        topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), 0, dp(6), 0)
         }
-        root.addView(shutter)
+        root.addView(topBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64), Gravity.TOP))
 
-        status = TextView(this).apply { textSize = 12f; setPadding(24, 8, 24, 8) }
-        root.addView(status)
-
-        root.addView(label("Modo"))
-        root.addView(radioRow(listOf("Foto", "Video"), 0) { setVideoMode(it == 1) })
-
-        root.addView(label("Lente"))
-        root.addView(radioRow(Lens.values().map { it.label }, lens.ordinal) { selectLens(Lens.values()[it]) })
-
-        // ---------------- foto
-        photoBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        photoBox.addView(label("HDR (procesamiento)"))
-        photoBox.addView(radioRow(listOf("Activo (8 fotos)", "Mejorado (15 fotos)"), hdrMode - 1) {
-            hdrMode = it + 1; save(); updateShutter(); updatePreview()
-        })
-        photoBox.addView(switchRow("Ultra HDR (archivo con gain map para pantallas HDR)", ultraHdr) {
-            ultraHdr = it; save(); updateShutter()
-        })
-        photoBox.addView(switchRow("Modo noche", nightMode) {
-            nightMode = it
-            nightBox.visibility = if (it) View.VISIBLE else View.GONE
-            updateShutter(); updatePreview()
-        })
-        nightBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        // Contador de video, mensajes y panel de información
+        recTimer = TextView(this).apply {
+            textSize = 26f
+            setTextColor(Color.WHITE)
+            setShadowLayer(4f, 0f, 0f, Color.BLACK)
             visibility = View.GONE
-            addView(label("Fotos por toma nocturna"))
-            val opts = listOf(10, 15, 20)
-            addView(radioRow(opts.map { "$it" }, opts.indexOf(nightFrames)) {
-                nightFrames = opts[it]; save(); updateShutter()
+        }
+        root.addView(recTimer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
+            topMargin = dp(72); leftMargin = dp(16)
+        })
+        infoPanel = TextView(this).apply {
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply { cornerRadius = dp(10).toFloat(); setColor(Color.argb(200, 0, 0, 0)) }
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            visibility = View.GONE
+        }
+        root.addView(infoPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP).apply {
+            topMargin = dp(72); leftMargin = dp(10); rightMargin = dp(10)
+        })
+        msgView = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(Color.argb(190, 0, 0, 0)) }
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            visibility = View.GONE
+        }
+        root.addView(msgView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
+            topMargin = dp(120); leftMargin = dp(24); rightMargin = dp(24)
+        })
+
+        // Botones rápidos a la derecha del visor
+        rightCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        btnEv = circleBtn("EV", 48) { openSlider(1) }
+        btnHl = circleBtn("LUZ", 48) { openSlider(2) }
+        btnTime = circleBtn("1/s", 48) { openSlider(3) }
+        listOf(btnEv, btnHl, btnTime).forEach {
+            rightCol.addView(it, LinearLayout.LayoutParams(dp(48), dp(48)).apply { topMargin = dp(10) })
+        }
+        root.addView(rightCol, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END).apply {
+            rightMargin = dp(14)
+        })
+
+        // Panel deslizable (EV / luces altas / tiempo)
+        sliderLabel = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 13f; gravity = Gravity.CENTER
+        }
+        sliderBar = seek(10) { p -> onSlider(p) }
+        sliderPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(Color.argb(190, 0, 0, 0)) }
+            setPadding(dp(8), dp(8), dp(8), dp(4))
+            addView(sliderLabel)
+            addView(sliderBar)
+            visibility = View.GONE
+        }
+        root.addView(sliderPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP).apply {
+            leftMargin = dp(14); rightMargin = dp(76)
+        })
+
+        // Lentes
+        lensRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            background = pill(Color.argb(140, 0, 0, 0))
+            setPadding(dp(6), dp(4), dp(6), dp(4))
+        }
+        listOf(Lens.UGA, Lens.MAIN, Lens.TELE).forEach { l ->
+            lensRow.addView(circleBtn(l.label, 44) { selectLens(l) }.apply { tag = l },
+                LinearLayout.LayoutParams(dp(44), dp(44)).apply { leftMargin = dp(4); rightMargin = dp(4) })
+        }
+        root.addView(lensRow, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+
+        // Zona inferior: modos, disparador, ajustes
+        bottomArea = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(6), 0, dp(10))
+        }
+        modesRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        Mode.values().forEach { m ->
+            modesRow.addView(TextView(this).apply {
+                text = m.label
+                textSize = 16f
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                setPadding(dp(16), dp(8), dp(16), dp(8))
+                tag = m
+                setOnClickListener { setMode(m) }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                leftMargin = dp(2); rightMargin = dp(2)
             })
         }
-        photoBox.addView(nightBox)
-        hlLabel = label(hlText())
-        photoBox.addView(hlLabel)
-        photoBox.addView(seek(9) { p ->
-            hlSteps = p; save(); hlLabel.text = hlText()
-        }.apply { progress = hlSteps })
-        hdrLabel = label("")
-        photoBox.addView(hdrLabel)
+        bottomArea.addView(modesRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val shutterRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(14), 0, dp(10))
+        }
+        fun slot(v: View, size: Int) = FrameLayout(this).apply {
+            addView(v, FrameLayout.LayoutParams(dp(size), dp(size), Gravity.CENTER))
+        }
+        thumb = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = oval(DARK, dp(2), Color.WHITE)
+            clipToOutline = true
+            setOnClickListener { openLast() }
+        }
+        val shutter = FrameLayout(this).apply {
+            background = oval(Color.TRANSPARENT, dp(4), Color.WHITE)
+            setOnClickListener { onShutter() }
+        }
+        shutterInner = View(this)
+        shutter.addView(shutterInner, FrameLayout.LayoutParams(dp(66), dp(66), Gravity.CENTER))
+        val flip = circleBtn("⟲", 56) { flipCamera() }.apply { textSize = 24f }
+        shutterRow.addView(slot(thumb, 56), LinearLayout.LayoutParams(0, dp(84), 1f))
+        shutterRow.addView(slot(shutter, 84), LinearLayout.LayoutParams(0, dp(84), 1f))
+        shutterRow.addView(slot(flip, 56), LinearLayout.LayoutParams(0, dp(84), 1f))
+        bottomArea.addView(shutterRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val bottomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(20), 0, dp(20), 0)
+        }
+        bottomRow.addView(circleBtn("⚙", 52) { openSettings() }.apply { textSize = 22f })
+        bottomArea.addView(bottomRow)
+        root.addView(bottomArea, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+
+        buildSettingsSheet()
+        root.addView(settingsSheet, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        setContentView(root)
+        updateModeUi()
+        root.post { relayout() }
+    }
+
+    private fun buildSettingsSheet() {
+        settingsSheet = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(240, 12, 12, 12))
+            visibility = View.GONE
+            isClickable = true
+        }
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, dp(48))
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(8), dp(12), dp(8))
+            addView(TextView(context).apply {
+                text = "Ajustes"; textSize = 22f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(circleBtn("✕", 44) { settingsSheet.visibility = View.GONE }.apply { textSize = 18f })
+        }
+        col.addView(header)
+
+        sheetLensLabel = sheetLabel("").apply { typeface = Typeface.DEFAULT_BOLD; setTextColor(GREEN) }
+        col.addView(sheetLensLabel)
+        col.addView(sheetLabel("Reducción de ruido"))
+        nrGroup = radioRow(listOf("Auto", "Off", "Rápido", "Alta"), -1) { prof().nr = it; save(); updatePreview() }
+        col.addView(nrGroup)
+        col.addView(sheetLabel("Nitidez"))
+        edgeGroup = radioRow(listOf("Auto", "Off", "Rápido", "Alta"), -1) { prof().edge = it; save(); updatePreview() }
+        col.addView(edgeGroup)
+        hdrLabel = sheetLabel("")
+        col.addView(hdrLabel)
         hdrBar = seek(150) { p ->
             prof().hdr = p
             hdrLabel.text = "Intensidad Ultra HDR: $p%"
             save()
         }
-        photoBox.addView(hdrBar)
-        root.addView(photoBox)
+        col.addView(hdrBar)
 
-        // ---------------- video
-        videoBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            addView(label("Resolución"))
-            addView(radioRow(listOf("FHD 1080p", "4K"), if (v4k) 1 else 0) {
-                v4k = it == 1; save(); updateShutter(); restartVideo()
-            })
-            addView(label("Cuadros por segundo"))
-            addView(radioRow(listOf("30 fps", "60 fps"), if (v60) 1 else 0) {
-                v60 = it == 1; save(); updateShutter(); restartVideo()
-            })
-        }
-        root.addView(videoBox)
+        col.addView(sheetLabel("Generales").apply { typeface = Typeface.DEFAULT_BOLD; setTextColor(GREEN) })
+        col.addView(sheetLabel("Fotos por toma en modo Noche"))
+        val opts = listOf(10, 15, 20)
+        col.addView(radioRow(opts.map { "$it" }, opts.indexOf(nightFrames)) {
+            nightFrames = opts[it]; save(); updateModeUi()
+        })
 
-        // ---------------- ajustes por lente
-        expLabel = label("")
-        root.addView(expLabel)
-        expBar = seek(72) { p ->
-            prof().exp = p - 36
-            expLabel.text = "Exposición: %+.1f EV".format(prof().exp / 6f)
-            save(); updatePreview()
-        }
-        root.addView(expBar)
-
-        root.addView(label("Reducción de ruido"))
-        nrGroup = radioRow(listOf("Auto", "Off", "Rápido", "Alta"), -1) { prof().nr = it; save(); updatePreview() }
-        root.addView(nrGroup)
-
-        root.addView(label("Nitidez (edge)"))
-        edgeGroup = radioRow(listOf("Auto", "Off", "Rápido", "Alta"), -1) { prof().edge = it; save(); updatePreview() }
-        root.addView(edgeGroup)
-
-        // ---------------- experimental
-        root.addView(label("Motor propio Qualcomm / Motorola (experimental)"))
-        fun vendorSwitch(t: String, onSet: (Boolean) -> Unit) = root.addView(Switch(this).apply {
+        col.addView(sheetLabel("Motor propio Qualcomm / Motorola (experimental)").apply { typeface = Typeface.DEFAULT_BOLD; setTextColor(GREEN) })
+        fun vendorSwitch(t: String, onSet: (Boolean) -> Unit) = col.addView(Switch(this).apply {
             text = t
-            setPadding(24, 8, 24, 8)
+            setTextColor(Color.WHITE)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
             setOnCheckedChangeListener { sw, checked ->
                 if (suppress) return@setOnCheckedChangeListener
                 onSet(checked)
@@ -440,77 +673,202 @@ class MainActivity : Activity() {
         vendorSwitch("SHDR: HDR escalonado") { vShdr = it }
         vendorSwitch("ZSL de Motorola") { vZsl = it }
         vendorSwitch("Marcar cliente como Moto Camera") { vMoto = it }
-
-        root.addView(switchRow("Lente físico directo (experimental)", false) {
-            physicalMode = it
-            if (device != null) startSession()
+        col.addView(Switch(this).apply {
+            text = "Lente físico directo"
+            setTextColor(Color.WHITE)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            setOnCheckedChangeListener { _, c ->
+                if (suppress) return@setOnCheckedChangeListener
+                physicalMode = c
+                if (device != null) startSession()
+            }
         })
-
-        setContentView(ScrollView(this).apply { addView(root) })
-        refreshControls()
-        updateShutter()
+        settingsSheet.addView(ScrollView(this).apply { addView(col) })
     }
 
-    private fun hlText(): String {
-        val ev = hlSteps / 3f
-        return "Protección de luces altas: %.1f EV".format(ev) +
-            if (hlSteps == 0) "  (sin margen: no se genera Ultra HDR)" else ""
+    private fun openSettings() {
+        closeSlider()
+        refreshControls()
+        settingsSheet.visibility = View.VISIBLE
+    }
+
+    /** Ubica los elementos que dependen del tamaño del visor. */
+    private fun relayout() {
+        val sw = resources.displayMetrics.widthPixels
+        val top = previewTop()
+        val ph = previewHeight()
+        previewFrame.layoutParams = FrameLayout.LayoutParams(sw, ph).apply { topMargin = top }
+        val bottomLimit = if (root.height > 0) root.height - bottomArea.height else top + ph
+        val visBottom = min(top + ph, bottomLimit)
+        (lensRow.layoutParams as FrameLayout.LayoutParams).topMargin = visBottom - dp(64)
+        (rightCol.layoutParams as FrameLayout.LayoutParams).topMargin = visBottom - dp(64) - dp(186)
+        (sliderPanel.layoutParams as FrameLayout.LayoutParams).topMargin = visBottom - dp(64) - dp(100)
+        lensRow.requestLayout()
+        rightCol.requestLayout()
+        sliderPanel.requestLayout()
+        previewFrame.requestLayout()
+    }
+
+    private fun rebuildTopBar() {
+        topBar.removeAllViews()
+        topBar.addView(circleBtn("i", 40) {
+            infoOn = !infoOn
+            infoPanel.visibility = if (infoOn) View.VISIBLE else View.GONE
+            refreshInfo()
+            rebuildTopBar()
+        }.apply { setOn(this, infoOn); textSize = 16f; typeface = Typeface.SERIF })
+        topBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        fun add(v: TextView) = topBar.addView(v, LinearLayout.LayoutParams(dp(46), dp(46)).apply { leftMargin = dp(8) })
+
+        if (videoMode) {
+            add(circleBtn(if (v4k) "4K" else "FHD", 46) {
+                if (!recording) { v4k = !v4k; save(); rebuildTopBar(); restartVideo() }
+            })
+            add(circleBtn(if (v60) "60" else "30", 46) {
+                if (!recording) { v60 = !v60; save(); rebuildTopBar(); restartVideo() }
+            })
+        } else {
+            add(circleBtn("UHDR", 46) {
+                ultraHdr = !ultraHdr; save(); rebuildTopBar()
+                say(if (ultraHdr) "Ultra HDR activado" else "Ultra HDR desactivado: JPEG común")
+            }.apply { setOn(this, ultraHdr); textSize = 10f })
+            if (nightMode) {
+                add(circleBtn("$nightFrames", 46) {
+                    nightFrames = when (nightFrames) { 10 -> 15; 15 -> 20; else -> 10 }
+                    save(); rebuildTopBar(); say("Modo noche: $nightFrames fotos por toma")
+                })
+            }
+            add(circleBtn(if (TIMERS[timerIdx] == 0) "⏱" else "${TIMERS[timerIdx]}s", 46) {
+                timerIdx = (timerIdx + 1) % TIMERS.size; save(); rebuildTopBar()
+                say(if (TIMERS[timerIdx] == 0) "Temporizador apagado" else "Temporizador: ${TIMERS[timerIdx]} s")
+            }.apply { setOn(this, TIMERS[timerIdx] > 0); textSize = if (TIMERS[timerIdx] == 0) 18f else 12f })
+        }
+        add(circleBtn(AWB_LABELS[awbIdx], 46) {
+            awbIdx = (awbIdx + 1) % AWB_MODES.size; save(); rebuildTopBar(); updatePreview()
+            say("Balance de blancos: ${AWB_NAMES[awbIdx]}")
+        }.apply { setOn(this, awbIdx != 0); textSize = 11f })
+        add(circleBtn("#", 46) {
+            gridOn = !gridOn; save()
+            grid.visibility = if (gridOn) View.VISIBLE else View.GONE
+            rebuildTopBar()
+        }.apply { setOn(this, gridOn); textSize = 18f })
+    }
+
+    private fun updateModeUi() {
+        modesRow.kids().forEach { v ->
+            val sel = v.tag == mode
+            (v as TextView).apply {
+                background = if (sel) pill(GREEN) else null
+                setTextColor(if (sel) Color.BLACK else Color.WHITE)
+            }
+        }
+        rebuildTopBar()
+        btnHl.visibility = if (videoMode) View.GONE else View.VISIBLE
+        btnTime.visibility = if (videoMode) View.GONE else View.VISIBLE
+        if (videoMode && activeSlider >= 2) closeSlider()
+        updateQuickButtons()
+        updateLensRow()
+        updateShutterLook()
+        recTimer.visibility = if (videoMode) View.VISIBLE else View.GONE
+        if (videoMode && !recording) recTimer.text = "00:00"
+        relayout()
+        refreshInfo()
+    }
+
+    private fun updateLensRow() {
+        lensRow.visibility = if (lens.front) View.GONE else View.VISIBLE
+        lensRow.kids().forEach { v ->
+            val sel = v.tag == lens
+            (v as TextView).apply {
+                setOn(this, false)
+                setTextColor(if (sel) GREEN else Color.WHITE)
+                textSize = if (sel) 15f else 12f
+            }
+        }
+    }
+
+    private fun updateShutterLook() {
+        shutterInner.background = when {
+            videoMode && recording -> GradientDrawable().apply { cornerRadius = dp(8).toFloat(); setColor(Color.rgb(230, 30, 30)) }
+            videoMode -> oval(Color.rgb(230, 30, 30), dp(10), Color.WHITE)
+            else -> oval(Color.WHITE)
+        }
+        val lp = shutterInner.layoutParams as FrameLayout.LayoutParams
+        val s = if (videoMode && recording) dp(34) else dp(66)
+        lp.width = s; lp.height = s
+        shutterInner.layoutParams = lp
+    }
+
+    private fun updateQuickButtons() {
+        setOn(btnEv, prof().exp != 0)
+        setOn(btnHl, hlSteps != 3)
+        setOn(btnTime, shutterIdx != 0)
+        btnTime.text = if (shutterIdx == 0) "1/s" else fmtT(SHUTTER_NS[shutterIdx]).replace(" s", "")
+        btnTime.textSize = if (shutterIdx == 0) 12f else 10f
+    }
+
+    // ------------------------------------------------------------------ deslizadores rápidos
+
+    private fun openSlider(kind: Int) {
+        if (activeSlider == kind) { closeSlider(); return }
+        activeSlider = kind
+        when (kind) {
+            1 -> { sliderBar.max = 72; sliderBar.progress = prof().exp + 36 }
+            2 -> { sliderBar.max = 9; sliderBar.progress = hlSteps }
+            3 -> { sliderBar.max = SHUTTER_NS.size - 1; sliderBar.progress = shutterIdx }
+        }
+        sliderLabel.text = sliderText()
+        sliderPanel.visibility = View.VISIBLE
+    }
+
+    private fun closeSlider() {
+        activeSlider = 0
+        sliderPanel.visibility = View.GONE
+    }
+
+    private fun onSlider(p: Int) {
+        when (activeSlider) {
+            1 -> { prof().exp = p - 36; save(); updatePreview() }
+            2 -> { hlSteps = p; save() }
+            3 -> { shutterIdx = p; save() }
+        }
+        sliderLabel.text = sliderText()
+        updateQuickButtons()
+    }
+
+    private fun sliderText(): String = when (activeSlider) {
+        1 -> "Exposición (${lens.label}): %+.1f EV".format(prof().exp / 6f)
+        2 -> "Protección de luces altas: %.1f EV".format(hlSteps / 3f) +
+            if (hlSteps == 0) "\nsin margen: no se genera Ultra HDR" else ""
+        3 -> {
+            val ns = SHUTTER_NS[shutterIdx]
+            if (ns == 0L) "Tiempo por foto: automático"
+            else "Tiempo por foto: ${fmtT(ns)}" +
+                (if (ns > expMax) "\neste lente llega hasta ${fmtT(expMax)}" else "") +
+                (if (ns >= 125_000_000L) "\nusá trípode o apoyá el celu" else "")
+        }
+        else -> ""
     }
 
     private fun refreshControls() {
         val p = prof()
         suppress = true
-        expBar.progress = p.exp + 36
-        expLabel.text = "Exposición: %+.1f EV".format(p.exp / 6f)
         (nrGroup.getChildAt(p.nr) as RadioButton).isChecked = true
         (edgeGroup.getChildAt(p.edge) as RadioButton).isChecked = true
         hdrBar.progress = p.hdr
         hdrLabel.text = "Intensidad Ultra HDR: ${p.hdr}%"
+        sheetLensLabel.text = "Lente actual: ${if (lens.front) "frontal" else lens.label} (se guarda por lente)"
         suppress = false
     }
 
-    private fun updateShutter() {
-        shutter.text = when {
-            videoMode && recording -> "■  DETENER"
-            videoMode -> "●  GRABAR  (${if (v4k) "4K" else "FHD"} ${if (v60) 60 else 30} fps)"
-            nightMode -> "FOTO  (noche, $nightFrames fotos" + (if (ultraHdr) " + Ultra HDR)" else ")")
-            else -> "FOTO  (HDR " + (if (hdrMode == 2) "mejorado" else "activo") +
-                (if (ultraHdr) " + Ultra HDR)" else ")")
-        }
+    // ------------------------------------------------------------------ mensajes e información
+
+    private fun say(msg: String) = runOnUiThread {
+        msgView.text = msg
+        msgView.visibility = View.VISIBLE
+        main.removeCallbacks(hideMsg)
+        main.postDelayed(hideMsg, 3500)
     }
-
-    private fun restartVideo() {
-        if (videoMode && !recording && device != null) startSession()
-    }
-
-    private fun setVideoMode(v: Boolean) {
-        if (recording) camHandler.post { stopRecording() }
-        videoMode = v
-        photoBox.visibility = if (v) View.GONE else View.VISIBLE
-        videoBox.visibility = if (v) View.VISIBLE else View.GONE
-        previewFrame.layoutParams = LinearLayout.LayoutParams(resources.displayMetrics.widthPixels, previewHeight())
-        updateShutter()
-        if (device != null) camHandler.post { startSession() }
-    }
-
-    private fun cameraIdFor(l: Lens) = if (l.front) (frontId ?: "1") else "0"
-    private val usePhysical get() = physicalMode && !lens.front
-
-    private fun selectLens(l: Lens) {
-        if (recording) camHandler.post { stopRecording() }
-        val newId = cameraIdFor(l)
-        lens = l
-        focusRegion = null
-        afWatching = false
-        focusRing.visibility = View.INVISIBLE
-        refreshControls()
-        if (newId != camId) {
-            closeCamera()
-            openCamera()
-        } else if (usePhysical) startSession() else updatePreview()
-    }
-
-    private fun say(msg: String) = runOnUiThread { status.text = msg }
 
     private fun statusLine(): String {
         val where = when {
@@ -519,12 +877,97 @@ class MainActivity : Activity() {
             else -> "lógico"
         }
         val what = when {
-            videoMode && recording -> "● GRABANDO ${videoSize.height}p $videoFps fps"
             videoMode -> "video ${videoSize.height}p $videoFps fps"
-            nightMode -> "noche $nightFrames fotos"
-            else -> "HDR " + if (hdrMode == 2) "mejorado" else "activo"
+            nightMode -> "noche, $nightFrames fotos"
+            mode == Mode.MEJORADO -> "HDR mejorado, 15 fotos"
+            else -> "HDR activo, 8 fotos"
         }
-        return "${lens.label} · $where · $what$sessionNote$vendorLog"
+        return "${if (lens.front) "Frontal" else lens.label} · $where · $what"
+    }
+
+    private fun refreshInfo() = runOnUiThread {
+        if (infoOn) {
+            val live = if (lastT > 0) "Visor: ${fmtT(lastT)} · ISO $lastIso" else "Visor: midiendo..."
+            val lim = "Lente: ${fmtT(expMin.coerceAtLeast(1L))} a ${fmtT(expMax)} · ISO $isoMin a $isoMax"
+            infoPanel.text = listOf(statusLine(), live, lim, lastShotInfo, (sessionNote + vendorLog).trim())
+                .filter { it.isNotEmpty() }.joinToString("\n")
+        }
+    }
+
+    // ------------------------------------------------------------------ galería
+
+    private fun setThumb(bmp: Bitmap?) = runOnUiThread { if (bmp != null) thumb.setImageBitmap(bmp) }
+
+    private fun loadLastThumb() {
+        mergeExec.execute {
+            try {
+                val cols = arrayOf(MediaStore.MediaColumns._ID)
+                contentResolver.query(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cols,
+                    "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?", arrayOf("DCIM/Camera%"),
+                    "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+                )?.use { c ->
+                    if (c.moveToFirst()) {
+                        val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0))
+                        lastUri = uri; lastMime = "image/jpeg"
+                        setThumb(contentResolver.loadThumbnail(uri, Size(256, 256), null))
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun openLast() {
+        val uri = lastUri ?: return say("Todavía no hay fotos")
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, lastMime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+        } catch (_: Exception) {
+            say("No encontré una galería para abrirla")
+        }
+    }
+
+    // ------------------------------------------------------------------ modos y lentes
+
+    private fun setMode(m: Mode) {
+        if (m == mode) return
+        if (merger != null) { say("Esperá a que termine de procesar la foto"); return }
+        if (recording) camHandler.post { stopRecording() }
+        val wasVideo = videoMode
+        mode = m
+        save()
+        updateModeUi()
+        if (wasVideo != videoMode && device != null) camHandler.post { startSession() }
+    }
+
+    private fun restartVideo() {
+        if (videoMode && !recording && device != null) camHandler.post { startSession() }
+    }
+
+    private fun cameraIdFor(l: Lens) = if (l.front) (frontId ?: "1") else "0"
+    private val usePhysical get() = physicalMode && !lens.front
+
+    private fun flipCamera() {
+        if (recording) { say("Detené la grabación para girar la cámara"); return }
+        if (lens.front) selectLens(lastBackLens) else selectLens(Lens.FRONT)
+    }
+
+    private fun selectLens(l: Lens) {
+        if (l == lens) return
+        if (recording) camHandler.post { stopRecording() }
+        if (!l.front) lastBackLens = l
+        val newId = cameraIdFor(l)
+        lens = l
+        focusRegion = null
+        afWatching = false
+        focusRing.visibility = View.INVISIBLE
+        updateLensRow()
+        updateQuickButtons()
+        if (activeSlider == 1) sliderBar.progress = prof().exp + 36
+        if (activeSlider != 0) sliderLabel.text = sliderText()
+        if (newId != camId) {
+            closeCamera()
+            openCamera()
+        } else if (usePhysical) startSession() else updatePreview()
     }
 
     // ------------------------------------------------------------------ foco por toque
@@ -559,7 +1002,7 @@ class MainActivity : Activity() {
     }
 
     private fun setRingColor(c: Int) {
-        (focusRing.background as GradientDrawable).setStroke((resources.displayMetrics.density * 2).toInt(), c)
+        (focusRing.background as GradientDrawable).setStroke(dp(2), c)
     }
 
     private fun repeatingTargets(): List<Surface> =
@@ -579,7 +1022,6 @@ class MainActivity : Activity() {
             start.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
             afWatching = true
             s.capture(start.build(), previewCb, camHandler)
-            say("Enfocando... (mantené apretado para volver a foco automático)")
         } catch (e: Exception) {
             say("Foco: ${e.javaClass.simpleName} ${e.message}")
         }
@@ -636,7 +1078,7 @@ class MainActivity : Activity() {
                         val n = riskyName
                         runOnUiThread {
                             suppress = true; sw.isChecked = false; suppress = false
-                            status.text = "\"$n\" hizo caer la cámara (error $error). Lo desactivé y reabro."
+                            say("\"$n\" hizo caer la cámara (error $error). Lo desactivé y reabro.")
                             texture.postDelayed({ openCamera() }, 800)
                         }
                     } else {
@@ -775,6 +1217,7 @@ class MainActivity : Activity() {
                 if (videoMode) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
             )
         }
+        b.set(CaptureRequest.CONTROL_AWB_MODE, AWB_MODES[awbIdx])
         b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, p.exp)
         if (p.nr > 0) b.set(CaptureRequest.NOISE_REDUCTION_MODE, p.nr - 1)
         if (p.edge > 0) b.set(CaptureRequest.EDGE_MODE, p.edge - 1)
@@ -784,22 +1227,24 @@ class MainActivity : Activity() {
         return b
     }
 
+    private var infoTick = 0
+
     private val previewCb = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
             res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastT = it }
             res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
             if (riskySwitch != null && ++okFrames >= 30) { riskySwitch = null; riskyRevert = null }
+            if (infoOn && ++infoTick % 15 == 0) refreshInfo()
             if (afWatching) {
                 when (res.get(CaptureResult.CONTROL_AF_STATE)) {
                     CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED -> {
                         afWatching = false
-                        runOnUiThread { setRingColor(Color.GREEN); focusRing.animate().alpha(0.4f).setStartDelay(800).start() }
-                        say("Foco fijado. Mantené apretado para volver a automático.")
+                        runOnUiThread { setRingColor(GREEN); focusRing.animate().alpha(0.4f).setStartDelay(800).start() }
                     }
                     CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED -> {
                         afWatching = false
                         runOnUiThread { setRingColor(Color.RED); focusRing.animate().alpha(0.4f).setStartDelay(800).start() }
-                        say("No pudo enfocar ahí. Probá otro punto o mantené apretado.")
+                        say("No pudo enfocar ahí. Mantené apretado para volver a automático.")
                     }
                 }
             }
@@ -812,7 +1257,10 @@ class MainActivity : Activity() {
         try {
             val req = buildRequest(repeatingTemplate(), repeatingTargets()).build()
             s.setRepeatingRequest(req, previewCb, camHandler)
-            say(statusLine())
+            val note = (sessionNote + vendorLog).trim()
+            if (note.isNotEmpty() && note != lastNoteShown) say(note)
+            lastNoteShown = note
+            refreshInfo()
         } catch (e: Exception) {
             say("Visor: ${e.javaClass.simpleName} ${e.message}")
         }
@@ -849,10 +1297,26 @@ class MainActivity : Activity() {
             camHandler.post { if (recording) stopRecording() else startRecording() }
             return
         }
-        if (merger != null) { say("Todavía estoy procesando la foto anterior..."); return }
-        when {
-            nightMode -> startMerge(nightFrames, true)
-            hdrMode == 2 -> startMerge(15, false)
+        if (merger != null || countdown > 0) { say("Todavía estoy procesando la foto anterior..."); return }
+        val secs = TIMERS[timerIdx]
+        if (secs == 0) { shoot(); return }
+        countdown = secs
+        val tick = object : Runnable {
+            override fun run() {
+                if (countdown <= 0) { shoot(); return }
+                say("$countdown")
+                countdown--
+                main.postDelayed(this, 1000)
+            }
+        }
+        main.post(tick)
+    }
+
+    private fun shoot() {
+        countdown = 0
+        when (mode) {
+            Mode.NOCHE -> startMerge(nightFrames, true)
+            Mode.MEJORADO -> startMerge(15, false)
             else -> startMerge(8, false)
         }
     }
@@ -871,7 +1335,7 @@ class MainActivity : Activity() {
 
     private fun stamp() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
-    // ------------------------------------------------------------------ fusión (HDR activo / mejorado / noche)
+    // ------------------------------------------------------------------ fusión (Foto / Mejorado / Noche)
 
     /**
      * Ráfaga de N fotos idénticas y subexpuestas (estilo HDR+ de la GCam). Al promediarlas baja el ruido,
@@ -888,13 +1352,17 @@ class MainActivity : Activity() {
             // Noche: +1 EV extra sobre lo que mide el visor, que en la oscuridad se queda corto
             val boost = if (night) 1.0 else 0.0
             val p = t0.toDouble() * iso0 * 2.0.pow(boost - u)
-            val tMax = if (night) 125_000_000L else 33_000_000L
-            val t = (p / isoMin).toLong().coerceAtMost(tMax).coerceIn(expMin, expMax)
+            val manual = SHUTTER_NS[shutterIdx]
+            val t = if (manual > 0L) {
+                manual.coerceIn(expMin, expMax)
+            } else {
+                val tMax = if (night) 125_000_000L else 33_000_000L
+                (p / isoMin).toLong().coerceAtMost(tMax).coerceIn(expMin, expMax)
+            }
             val iso = (p / t).roundToInt().coerceIn(isoMin, isoMax)
 
-            pendingLens = lens
-            val tag = if (night) "NOCHE" else if (hdrMode == 2) "HDRM" else "HDR"
-            val m = Merger(n, u, night, ultraHdr, prof().hdr / 100f, tag, lens.name)
+            val tag = when (mode) { Mode.NOCHE -> "NOCHE"; Mode.MEJORADO -> "HDRM"; else -> "HDR" }
+            val m = Merger(n, u, night, ultraHdr, prof().hdr / 100f, tag, lens.name, t, iso)
             merger = m
 
             val reqs = List(n) {
@@ -915,7 +1383,7 @@ class MainActivity : Activity() {
             // Red de seguridad: si algún cuadro nunca llega, fusiona con los que haya
             val waitMs = n * (max(t, 33_333_333L) / 1_000_000L + 400L) + 6_000L
             camHandler.postDelayed({ if (merger === m) m.forceFinish() }, waitMs)
-            say("Toma de $n fotos (1/${(1e9 / t).roundToInt()} s, ISO $iso). Mantené quieto el celu...")
+            say("$n fotos · ${fmtT(t)} · ISO $iso\nmantené quieto el celu")
         } catch (e: Exception) {
             merger = null
             say("Ráfaga: ${e.javaClass.simpleName} ${e.message}")
@@ -929,13 +1397,17 @@ class MainActivity : Activity() {
         val makeGain: Boolean,
         val k: Float,
         val tag: String,
-        val lensName: String
+        val lensName: String,
+        val shotT: Long,
+        val shotIso: Int
     ) {
         @Volatile private var received = 0
         @Volatile private var expected = total
         @Volatile private var finished = false
+        private val started = System.currentTimeMillis()
         private var processed = 0
         private var merged = 0
+        private var maxShift = 0
 
         // Solo se tocan desde mergeExec
         private var w = 0
@@ -955,7 +1427,7 @@ class MainActivity : Activity() {
         fun offer(bytes: ByteArray) {
             received++
             val got = received
-            say("Capturando $got/$total... mantené quieto el celu")
+            say("Capturando $got/$total...")
             mergeExec.execute {
                 try { add(bytes) } catch (_: Throwable) {}
                 processed++
@@ -980,7 +1452,6 @@ class MainActivity : Activity() {
         }
 
         private fun add(bytes: ByteArray) {
-            // Alineación: mapa a 1/4 de resolución
             val small = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 4 }) ?: return
             val code = lumaCode(small)
             val smw = small.width
@@ -998,6 +1469,7 @@ class MainActivity : Activity() {
                 val sft = estimateShift(refBits!!, refMask!!, mtb(code, th), mtbMask(code, th), sw, sh)
                 dx = sft[0] * 4
                 dy = sft[1] * 4
+                maxShift = max(maxShift, max(abs(dx), abs(dy)))
             }
 
             val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
@@ -1043,10 +1515,16 @@ class MainActivity : Activity() {
             val name = "IMG_${stamp()}_${lensName}_$tag"
             try {
                 if (merged == 0) { say("No llegó ninguna foto de la ráfaga"); return }
-                say("Fusionando $merged fotos...")
+                say("Procesando $merged fotos...")
                 val out = render()
-                saveImage(out, "$name.jpg")
-                say("Guardada: $name.jpg ($merged fotos fusionadas)")
+                val uri = saveImage(out, "$name.jpg")
+                if (uri != null) { lastUri = uri; lastMime = "image/jpeg" }
+                setThumb(BitmapFactory.decodeByteArray(out, 0, out.size, BitmapFactory.Options().apply { inSampleSize = 16 }))
+                val secs = (System.currentTimeMillis() - started) / 1000.0
+                lastShotInfo = "Última: $tag · $merged/$total fotos · ${fmtT(shotT)} · ISO $shotIso\n" +
+                    "desplazamiento máx $maxShift px · %.1f s · %s".format(secs, if (makeGain && u > 0f) "Ultra HDR" else "JPEG común")
+                refreshInfo()
+                say("Guardada ($merged fotos)")
             } catch (t: Throwable) {
                 say("Fusión: ${t.javaClass.simpleName} ${t.message}")
             } finally {
@@ -1180,6 +1658,15 @@ class MainActivity : Activity() {
         }
     }
 
+    private val recTick = object : Runnable {
+        override fun run() {
+            if (!recording) return
+            val s = (System.currentTimeMillis() - recStart) / 1000
+            recTimer.text = "● %02d:%02d".format(s / 60, s % 60)
+            main.postDelayed(this, 500)
+        }
+    }
+
     /** Se llama en camHandler. */
     private fun startRecording() {
         if (session == null || recSurface == null) return say("Cámara no lista para video")
@@ -1205,13 +1692,14 @@ class MainActivity : Activity() {
             recorder = rec
             recPfd = pfd
             recUri = uri
-            runOnUiThread { updateShutter() }
+            recStart = System.currentTimeMillis()
+            runOnUiThread { updateShutterLook(); main.post(recTick) }
         } catch (e: Exception) {
             recording = false
             try { pfd?.close() } catch (_: Exception) {}
             uri?.let { try { contentResolver.delete(it, null, null) } catch (_: Exception) {} }
             updatePreview()
-            runOnUiThread { updateShutter() }
+            runOnUiThread { updateShutterLook() }
             say("Video: ${e.javaClass.simpleName} ${e.message}")
         }
     }
@@ -1226,32 +1714,36 @@ class MainActivity : Activity() {
         try { rec?.release() } catch (_: Exception) {}
         try { recPfd?.close() } catch (_: Exception) {}
         recPfd = null
-        recUri?.let { uri ->
+        val uri = recUri
+        recUri = null
+        if (uri != null) {
             try {
                 if (ok) {
                     contentResolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+                    lastUri = uri; lastMime = "video/mp4"
+                    setThumb(try { contentResolver.loadThumbnail(uri, Size(256, 256), null) } catch (_: Exception) { null })
                 } else {
                     contentResolver.delete(uri, null, null)
                 }
             } catch (_: Exception) {}
         }
-        recUri = null
         updatePreview()
-        runOnUiThread { updateShutter() }
-        say(if (ok) "Video guardado en DCIM/Camera" else "El video quedó vacío y se descartó")
+        runOnUiThread { updateShutterLook(); recTimer.text = "00:00" }
+        say(if (ok) "Video guardado" else "El video quedó vacío y se descartó")
     }
 
     // ------------------------------------------------------------------ guardado
 
-    private fun saveImage(bytes: ByteArray, name: String) {
+    private fun saveImage(bytes: ByteArray, name: String): Uri? {
         val v = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
             put(MediaStore.MediaColumns.RELATIVE_PATH, "DCIM/Camera")
             put(MediaStore.MediaColumns.DATE_TAKEN, System.currentTimeMillis())
         }
-        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: return
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: return null
         contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+        return uri
     }
 }
 
