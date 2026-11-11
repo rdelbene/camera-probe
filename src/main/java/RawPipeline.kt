@@ -501,3 +501,50 @@ fun applyLook(px: IntArray, toneLut: IntArray, sat: Float) {
         px[i] = (0xFF shl 24) or (ch(r) shl 16) or (ch(g) shl 8) or ch(b)
     }
 }
+
+// ---------------------------------------------------------------------- modo Stock: Ultra HDR sobre la foto del celu
+
+private fun toLinear(c: Float): Float =
+    if (c <= 0.04045f) c / 12.92f else ((c + 0.055f) / 1.055f).toDouble().pow(2.4).toFloat()
+
+private fun Double.pow(e: Double) = Math.pow(this, e)
+
+private fun lumaLinear(p: Int, lut: FloatArray): Float =
+    0.2126f * lut[(p shr 16) and 255] + 0.7152f * lut[(p shr 8) and 255] + 0.0722f * lut[p and 255]
+
+/**
+ * Gain map para el modo Stock. sdr: la foto normal del procesador del celu; under: una toma igual pero
+ * más oscura; ambas reducidas al mismo tamaño (ARGB). ratio: cuántas veces más luz recibió sdr que under
+ * (tiempo × ISO de cada una). maxBoost: cuánto se pueden iluminar como máximo las luces (2 = 1 paso).
+ *
+ * En cada punto se compara la luz real (la oscura × ratio) con la que quedó en la foto normal. Solo se
+ * tiene en cuenta en las zonas claras, porque en el resto la curva del procesador hace que no sean comparables.
+ * Devuelve bytes 0..255 = log2(ganancia) / log2(maxBoost), o null si la escena no tiene luces que realzar.
+ */
+fun stockGainMap(sdr: IntArray, under: IntArray, w: Int, h: Int, ratio: Float, maxBoost: Float): ByteArray? {
+    if (maxBoost <= 1.01f || ratio <= 1f || sdr.size != under.size) return null
+    val lut = FloatArray(256) { toLinear(it / 255f) }
+    val logMax = kotlin.math.ln(maxBoost) / kotlin.math.ln(2f)
+    val lg = FloatArray(w * h)
+    var peak = 0f
+    for (i in 0 until w * h) {
+        val ys = lumaLinear(sdr[i], lut)
+        val p = sdr[i]
+        val yGamma = (77 * ((p shr 16) and 255) + 150 * ((p shr 8) and 255) + 29 * (p and 255)) / (256f * 255f)
+        // peso: 0 por debajo de 0.55 (gamma), 1 desde 0.9
+        val t = ((yGamma - 0.55f) / 0.35f).coerceIn(0f, 1f)
+        val wgt = t * t * (3f - 2f * t)
+        if (wgt <= 0f) continue
+        val yh = lumaLinear(under[i], lut) * ratio
+        val g = yh / ys.coerceAtLeast(1e-4f)
+        if (g <= 1f) continue
+        val v = (kotlin.math.ln(g) / kotlin.math.ln(2f) * wgt).coerceAtMost(logMax)
+        lg[i] = v
+        if (v > peak) peak = v
+    }
+    if (peak < 0.11f) return null // menos de ~8 % de realce: no vale la pena
+    val bl = binomial3(binomial3(lg, w, h), w, h)
+    return ByteArray(w * h) { (bl[it] / logMax * 255f).roundToIntSafe().coerceIn(0, 255).toByte() }
+}
+
+private fun Float.roundToIntSafe(): Int = (this + 0.5f).toInt()

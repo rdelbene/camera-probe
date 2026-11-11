@@ -92,9 +92,13 @@ enum class Lens(val label: String, val zoom: Float, val physicalId: String, val 
     FRONT("Frontal", 1.0f, "", true)
 }
 
-/** Modos del carrusel. FOTO = HDR activo (8 fotos), MEJORADO = 15 fotos, NOCHE = 10/15/20 fotos largas. */
+/**
+ * Modos del carrusel. STOCK = la foto del procesador del celu tal cual + Ultra HDR; FOTO = HDR activo (8 fotos),
+ * MEJORADO = 15 fotos, NOCHE = 10/15/20 fotos largas.
+ */
 enum class Mode(val label: String) {
     VIDEO("Video"),
+    STOCK("Stock"),
     FOTO("Foto"),
     MEJORADO("Mejorado"),
     NOCHE("Noche")
@@ -182,9 +186,13 @@ class MainActivity : Activity(), SensorEventListener {
     // ------------------------------------------------------------------ modos y ajustes
     private var lens = Lens.MAIN
     private var lastBackLens = Lens.MAIN
-    private var mode = Mode.FOTO
+    private var mode = Mode.STOCK
     private val videoMode get() = mode == Mode.VIDEO
     private val nightMode get() = mode == Mode.NOCHE
+    private val stockMode get() = mode == Mode.STOCK
+    /** Toma en curso del modo Stock (null si no hay). */
+    @Volatile private var stockShot: StockShot? = null
+    private fun busy() = merger != null || stockShot != null
     private var physicalMode = false
     /** Formato de archivo Ultra HDR (JPEG con gain map). */
     private var ultraHdr = true
@@ -295,7 +303,7 @@ class MainActivity : Activity(), SensorEventListener {
                 prefs.getInt("${l.name}_hdr2", 100)
             )
         }
-        mode = Mode.values().getOrNull(prefs.getInt("mode2", Mode.FOTO.ordinal)) ?: Mode.FOTO
+        mode = Mode.values().getOrNull(prefs.getInt("mode3", Mode.STOCK.ordinal)) ?: Mode.STOCK
         ultraHdr = prefs.getBoolean("ultraHdr", true)
         nightFrames = prefs.getInt("nightFrames", 15).let { if (it in listOf(10, 15, 20)) it else 15 }
         hlSteps = prefs.getInt("hlSteps", 3).coerceIn(0, 9)
@@ -373,7 +381,7 @@ class MainActivity : Activity(), SensorEventListener {
             e.putInt("${l.name}_exp", p.exp).putInt("${l.name}_nr2", p.nr)
                 .putInt("${l.name}_edge2", p.edge).putInt("${l.name}_hdr2", p.hdr)
         }
-        e.putInt("mode2", mode.ordinal).putBoolean("ultraHdr", ultraHdr).putInt("nightFrames", nightFrames)
+        e.putInt("mode3", mode.ordinal).putBoolean("ultraHdr", ultraHdr).putInt("nightFrames", nightFrames)
             .putInt("hlSteps", hlSteps).putInt("shutterIdx", shutterIdx).putInt("awbIdx", awbIdx)
             .putInt("timerIdx", timerIdx).putBoolean("grid", gridOn)
             .putBoolean("v4k", v4k).putBoolean("v60", v60).putBoolean("rawOn", rawOn)
@@ -776,7 +784,7 @@ class MainActivity : Activity(), SensorEventListener {
                 if (!recording) { v60 = !v60; save(); rebuildTopBar(); restartVideo() }
             })
         } else {
-            add(circleBtn("RAW", 46) {
+            if (!stockMode) add(circleBtn("RAW", 46) {
                 if (merger != null) return@circleBtn
                 rawOn = !rawOn; save(); rebuildTopBar()
                 say(when {
@@ -822,7 +830,9 @@ class MainActivity : Activity(), SensorEventListener {
         }
         rebuildTopBar()
         btnHl.visibility = if (videoMode) View.GONE else View.VISIBLE
-        btnTime.visibility = if (videoMode) View.GONE else View.VISIBLE
+        btnTime.visibility = if (videoMode || stockMode) View.GONE else View.VISIBLE
+        btnHl.text = if (stockMode) "HDR" else "LUZ"
+        if (stockMode && activeSlider == 3) closeSlider()
         if (videoMode && activeSlider >= 2) closeSlider()
         updateQuickButtons()
         updateLensRow()
@@ -859,7 +869,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun updateQuickButtons() {
         setOn(btnEv, prof().exp != 0)
-        setOn(btnHl, hlSteps != 3)
+        setOn(btnHl, if (stockMode) ultraHdr && prof().hdr != 100 else hlSteps != 3)
         setOn(btnTime, shutterIdx != 0)
         btnTime.text = if (shutterIdx == 0) "1/s" else fmtT(SHUTTER_NS[shutterIdx]).replace(" s", "")
         btnTime.textSize = if (shutterIdx == 0) 12f else 10f
@@ -872,7 +882,7 @@ class MainActivity : Activity(), SensorEventListener {
         activeSlider = kind
         when (kind) {
             1 -> { sliderBar.max = 72; sliderBar.progress = prof().exp + 36 }
-            2 -> { sliderBar.max = 9; sliderBar.progress = hlSteps }
+            2 -> if (stockMode) { sliderBar.max = 150; sliderBar.progress = prof().hdr } else { sliderBar.max = 9; sliderBar.progress = hlSteps }
             3 -> { sliderBar.max = SHUTTER_NS.size - 1; sliderBar.progress = shutterIdx }
         }
         sliderLabel.text = sliderText()
@@ -887,7 +897,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun onSlider(p: Int) {
         when (activeSlider) {
             1 -> { prof().exp = p - 36; save(); updatePreview() }
-            2 -> { hlSteps = p; save() }
+            2 -> { if (stockMode) prof().hdr = p else hlSteps = p; save() }
             3 -> { shutterIdx = p; save() }
         }
         sliderLabel.text = sliderText()
@@ -896,7 +906,10 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun sliderText(): String = when (activeSlider) {
         1 -> "Exposición (${lens.label}): %+.1f EV".format(prof().exp / 6f)
-        2 -> "Protección de luces altas: %.1f EV".format(hlSteps / 3f) +
+        2 -> if (stockMode) {
+            if (!ultraHdr) "Ultra HDR apagado (botón UHDR arriba)"
+            else "Nivel Ultra HDR (${lens.label}): ${prof().hdr}% · luces hasta ×%.1f".format(stockBoost())
+        } else "Protección de luces altas: %.1f EV".format(hlSteps / 3f) +
             if (hlSteps == 0) "\nsin margen: no se genera Ultra HDR" else ""
         3 -> {
             val ns = SHUTTER_NS[shutterIdx]
@@ -937,6 +950,7 @@ class MainActivity : Activity(), SensorEventListener {
         val what = when {
             videoMode -> "video ${videoSize.height}p $videoFps fps"
             nightMode -> "noche, $nightFrames fotos"
+            stockMode -> "stock + Ultra HDR ${if (ultraHdr) "${prof().hdr}%" else "apagado"}"
             mode == Mode.MEJORADO -> "HDR mejorado, 15 fotos"
             else -> "HDR activo, 8 fotos"
         }
@@ -989,13 +1003,15 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun setMode(m: Mode) {
         if (m == mode) return
-        if (merger != null) { say("Esperá a que termine de procesar la foto"); return }
+        if (busy()) { say("Esperá a que termine de procesar la foto"); return }
         if (recording) camHandler.post { stopRecording() }
         val wasVideo = videoMode
+        val wasStock = stockMode
+        closeSlider()
         mode = m
         save()
         updateModeUi()
-        if (wasVideo != videoMode && device != null) camHandler.post { startSession() }
+        if ((wasVideo != videoMode || wasStock != stockMode) && device != null) camHandler.post { startSession() }
     }
 
     private fun restartVideo() {
@@ -1012,7 +1028,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun selectLens(l: Lens) {
         if (l == lens) return
-        if (merger != null) { say("Esperá a que termine de procesar la foto"); return }
+        if (busy()) { say("Esperá a que termine de procesar la foto"); return }
         if (recording) camHandler.post { stopRecording() }
         if (!l.front) lastBackLens = l
         val newId = cameraIdFor(l)
@@ -1233,7 +1249,8 @@ class MainActivity : Activity(), SensorEventListener {
                 surfaces += ps
                 surfaces += rs
             } else {
-                val ss = pickSize(map.getOutputSizes(ImageFormat.JPEG), 4, 3, 4096)!!
+                // En Stock se pide el tamaño completo (el tele llega a 4624x3468, como la cámara stock)
+                val ss = pickSize(map.getOutputSizes(ImageFormat.JPEG), 4, 3, if (stockMode) 4640 else 4096)!!
                 val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), 4, 3, 1440)!!
                 st.setDefaultBufferSize(prev.width, prev.height)
                 val ps = Surface(st)
@@ -1244,7 +1261,7 @@ class MainActivity : Activity(), SensorEventListener {
                 surfaces += ps
                 surfaces += r.surface
                 sessKey = "$camId/${if (usePhysical) lens.physicalId else "L"}/${lens.name}"
-                if (rawOn && sessKey !in rawBlocked) setupRaw(chars, map)?.let { surfaces += it }
+                if (!stockMode && rawOn && sessKey !in rawBlocked) setupRaw(chars, map)?.let { surfaces += it }
             }
             runOnUiThread { if (!videoMode) rebuildTopBar() }
 
@@ -1419,7 +1436,7 @@ class MainActivity : Activity(), SensorEventListener {
             camHandler.post { if (recording) stopRecording() else startRecording() }
             return
         }
-        if (merger != null || countdown > 0) { say("Todavía estoy procesando la foto anterior..."); return }
+        if (busy() || countdown > 0) { say("Todavía estoy procesando la foto anterior..."); return }
         val secs = TIMERS[timerIdx]
         if (secs == 0) { shoot(); return }
         countdown = secs
@@ -1437,6 +1454,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun shoot() {
         countdown = 0
         when (mode) {
+            Mode.STOCK -> shootStock()
             Mode.NOCHE -> startMerge(nightFrames, true)
             Mode.MEJORADO -> startMerge(15, false)
             else -> startMerge(8, false)
@@ -1451,8 +1469,182 @@ class MainActivity : Activity(), SensorEventListener {
         } finally {
             img.close()
         }
+        val st = stockShot
+        if (st != null) { st.offer(bytes); return }
         val m = merger
         if (m != null && m.accepting()) m.offer(bytes)
+    }
+
+    // ------------------------------------------------------------------ modo Stock
+
+    /** Brillo máximo de las luces con el nivel elegido: 100 % = ×4 (2 pasos), 150 % = ×8, 50 % = ×2. */
+    private fun stockBoost(): Float = 2f.pow(2f * prof().hdr / 100f)
+
+    /**
+     * Una foto normal procesada por el celu (exposición, ruido, nitidez y color del fabricante) y, si Ultra HDR
+     * está activo, otra igual 3 pasos más oscura para medir las luces y armar el gain map.
+     */
+    private fun shootStock() {
+        val s = session ?: return say("Cámara no lista")
+        val target = reader?.surface ?: return say("Cámara no lista")
+        val boost = stockBoost()
+        val wantHdr = ultraHdr && prof().hdr > 0
+        val t0 = lastT
+        val iso0 = lastIso
+        val under = wantHdr && t0 > 0L && iso0 > 0
+        try {
+            val shot = StockShot(if (under) 2 else 1, boost, lens.name)
+            stockShot = shot
+            val orient = sensorOrientation
+            val normal = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(target)).apply {
+                set(CaptureRequest.JPEG_ORIENTATION, orient)
+                set(CaptureRequest.JPEG_QUALITY, 97.toByte())
+                setTag("sdr")
+            }.build()
+            val reqs = mutableListOf(normal)
+            if (under) {
+                // -3 EV respecto de lo que mide el visor: primero se acorta el tiempo, después se baja el ISO
+                val total = t0.toDouble() * iso0 / 8.0
+                val t = (total / isoMin).toLong().coerceAtMost(t0).coerceIn(expMin, expMax)
+                val iso = (total / t).roundToInt().coerceIn(isoMin, isoMax)
+                reqs += buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(target)).apply {
+                    set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, t)
+                    set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                    set(CaptureRequest.SENSOR_FRAME_DURATION, max(t, 33_333_333L))
+                    set(CaptureRequest.JPEG_ORIENTATION, orient)
+                    set(CaptureRequest.JPEG_QUALITY, 90.toByte())
+                    setTag("under")
+                }.build()
+            }
+            s.captureBurst(reqs, object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(ses: CameraCaptureSession, req: CaptureRequest, res: TotalCaptureResult) {
+                    shot.onResult(req.tag as? String, res)
+                }
+                override fun onCaptureFailed(ses: CameraCaptureSession, req: CaptureRequest, f: CaptureFailure) {
+                    shot.onFailed(req.tag as? String)
+                }
+            }, camHandler)
+            camHandler.postDelayed({ if (stockShot === shot) shot.giveUp() }, 8_000L)
+            say(if (under) "Foto stock + toma para Ultra HDR..." else "Foto stock...")
+        } catch (e: Exception) {
+            stockShot = null
+            say("Stock: ${e.javaClass.simpleName} ${e.message}")
+        }
+    }
+
+    private inner class StockShot(val expected: Int, val boost: Float, val lensName: String) {
+        private var sdr: ByteArray? = null
+        private var under: ByteArray? = null
+        private var got = 0
+        @Volatile private var sdrExposure = 0.0
+        @Volatile private var underExposure = 0.0
+        @Volatile private var sdrInfo = ""
+        @Volatile private var done = false
+
+        /** Las imágenes llegan en el mismo orden que los pedidos de la ráfaga: primero la normal. */
+        fun offer(bytes: ByteArray) {
+            if (done) return
+            if (got == 0) sdr = bytes else under = bytes
+            got++
+            if (got >= expected) finish()
+        }
+
+        fun onResult(tag: String?, r: TotalCaptureResult) {
+            val t = r.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
+            val iso = r.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
+            val boostRaw = (r.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100) / 100.0
+            val e = t.toDouble() * iso * boostRaw
+            if (tag == "under") underExposure = e else { sdrExposure = e; sdrInfo = "${fmtT(t)} · ISO $iso" }
+        }
+
+        fun onFailed(tag: String?) {
+            if (tag == "under") { got++; if (got >= expected) finish() }
+        }
+
+        fun giveUp() { if (!done) finish() }
+
+        private fun finish() {
+            if (done) return
+            done = true
+            val s = sdr
+            val u = under
+            mergeExec.execute {
+                val started = System.currentTimeMillis()
+                try {
+                    if (s == null) { say("No llegó la foto"); return@execute }
+                    val name = "IMG_${stamp()}_${lensName}_STOCK"
+                    // Esperar un poco los metadatos de la toma (suelen llegar junto con la imagen)
+                    var waited = 0
+                    while ((sdrExposure == 0.0 || (u != null && underExposure == 0.0)) && waited < 1000) { Thread.sleep(20); waited += 20 }
+                    val ratio = if (u != null && underExposure > 0.0 && sdrExposure > 0.0) (sdrExposure / underExposure).toFloat() else 0f
+                    val out = if (u != null && ratio > 1f) withGainMap(s, u, ratio) else null
+                    val bytes = out ?: s
+                    val uri = saveImage(bytes, "$name.jpg")
+                    if (uri != null) { lastUri = uri; lastMime = "image/jpeg" }
+                    setThumb(BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 16 }))
+                    val secs = (System.currentTimeMillis() - started) / 1000.0
+                    lastShotInfo = "Última: STOCK · $sdrInfo\n" + when {
+                        out != null -> "Ultra HDR: luces hasta ×%.1f · toma oscura ×%.1f menos luz · %.1f s".format(boost, ratio, secs)
+                        u != null && ratio > 1f -> "Sin luces que realzar: JPEG del celu sin tocar"
+                        ultraHdr -> "Ultra HDR no disponible en esta toma: JPEG del celu sin tocar"
+                        else -> "Ultra HDR apagado: JPEG del celu sin tocar"
+                    }
+                    refreshInfo()
+                    say(if (out != null) "Guardada (stock + Ultra HDR)" else "Guardada (stock)")
+                } catch (t: Throwable) {
+                    // Ante cualquier problema con el gain map se guarda la foto del celu tal cual
+                    try { if (s != null) saveImage(s, "IMG_${stamp()}_${lensName}_STOCK.jpg") } catch (_: Throwable) {}
+                    say("Ultra HDR: ${t.javaClass.simpleName} ${t.message}")
+                } finally {
+                    sdr = null; under = null
+                    if (stockShot === this) stockShot = null
+                }
+            }
+        }
+
+        /** Arma el gain map con las dos tomas y lo adjunta a la foto normal. Devuelve null si no hace falta. */
+        private fun withGainMap(sdrBytes: ByteArray, underBytes: ByteArray, ratio: Float): ByteArray? {
+            val opt = BitmapFactory.Options().apply { inSampleSize = 4 }
+            val a = BitmapFactory.decodeByteArray(sdrBytes, 0, sdrBytes.size, opt) ?: return null
+            val b = BitmapFactory.decodeByteArray(underBytes, 0, underBytes.size, opt) ?: return null
+            if (a.width != b.width || a.height != b.height) { a.recycle(); b.recycle(); return null }
+            val gw = a.width; val gh = a.height
+            val pa = IntArray(gw * gh); val pb = IntArray(gw * gh)
+            a.getPixels(pa, 0, gw, 0, 0, gw, gh); b.getPixels(pb, 0, gw, 0, 0, gw, gh)
+            a.recycle(); b.recycle()
+            val gm = stockGainMap(pa, pb, gw, gh, ratio, boost) ?: return null
+
+            // La orientación que puso el celu en el EXIF (los bitmaps se decodifican sin girar)
+            val exifRot = try {
+                when (android.media.ExifInterface(java.io.ByteArrayInputStream(sdrBytes))
+                    .getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, 1)) {
+                    6 -> 90; 3 -> 180; 8 -> 270; else -> 0
+                }
+            } catch (_: Exception) { 0 }
+            val full = BitmapFactory.decodeByteArray(sdrBytes, 0, sdrBytes.size) ?: return null
+            val img = if (exifRot != 0) {
+                Bitmap.createBitmap(full, 0, 0, full.width, full.height, Matrix().apply { postRotate(exifRot.toFloat()) }, true)
+                    .also { if (it !== full) full.recycle() }
+            } else full
+            val (rb, rw, rh) = rotateBytes(gm, gw, gh, exifRot)
+            val gbmp = Bitmap.createBitmap(rw, rh, Bitmap.Config.ALPHA_8)
+            gbmp.copyPixelsFromBuffer(ByteBuffer.wrap(rb))
+            val eps = 1f / 64f
+            val gain = Gainmap(gbmp)
+            gain.setRatioMin(1f, 1f, 1f)
+            gain.setRatioMax(boost, boost, boost)
+            gain.setGamma(1f, 1f, 1f)
+            gain.setEpsilonSdr(eps, eps, eps)
+            gain.setEpsilonHdr(eps, eps, eps)
+            gain.setDisplayRatioForFullHdr(boost)
+            gain.setMinDisplayRatioForHdrTransition(1f)
+            img.setGainmap(gain)
+            val bos = ByteArrayOutputStream()
+            img.compress(Bitmap.CompressFormat.JPEG, 97, bos)
+            img.recycle()
+            return bos.toByteArray()
+        }
     }
 
     private fun stamp() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
