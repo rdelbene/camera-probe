@@ -661,7 +661,9 @@ class MainActivity : Activity(), SensorEventListener {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(8), dp(12), dp(8))
             addView(TextView(context).apply {
+                val ver = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "" }
                 text = "Ajustes"; textSize = 22f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+                if (!ver.isNullOrEmpty()) append("  ·  build ${ver.substringAfterLast('.')}")
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(circleBtn("✕", 44) { settingsSheet.visibility = View.GONE }.apply { textSize = 18f })
         }

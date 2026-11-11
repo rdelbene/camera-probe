@@ -36,7 +36,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "build-${{ github.run_number }}" build/outputs/apk/debug/*.apk \
-            --title "UHDR Cam build ${{ github.run_number }}" --notes "APK debug"
+            --title "UHDR Cam build ${{ github.run_number }}" --notes "APK versión 1.0.${{ github.run_number }} (firma fija: se instala encima de la anterior)"
 
       - name: Publish build log on failure
         if: failure()
