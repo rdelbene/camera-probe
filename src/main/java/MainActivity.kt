@@ -93,14 +93,14 @@ enum class Lens(val label: String, val zoom: Float, val physicalId: String, val 
 }
 
 /**
- * Modos del carrusel. STOCK = la foto del procesador del celu tal cual + Ultra HDR; FOTO = HDR activo (8 fotos),
- * MEJORADO = 15 fotos, NOCHE = 10/15/20 fotos largas.
+ * Modos del carrusel:
+ *  FOTO  = la foto que procesa el chip de cámara con la afinación de Motorola + Ultra HDR con el nivel elegido
+ *          (si el sistema lo permite, Ultra HDR nativo JPEG_R, el mismo mecanismo que usa la cámara stock)
+ *  NOCHE = ráfaga RAW de 10/15/20 fotos fusionadas y reveladas por la app
  */
 enum class Mode(val label: String) {
     VIDEO("Video"),
-    STOCK("Stock"),
     FOTO("Foto"),
-    MEJORADO("Mejorado"),
     NOCHE("Noche")
 }
 
@@ -109,7 +109,7 @@ enum class Mode(val label: String) {
  * nr/edge: 0=Auto (criterio del fabricante) 1=off 2=rapido 3=alta.
  * hdr: intensidad del gain map Ultra HDR en %.
  */
-class Profile(var exp: Int = 0, var nr: Int = 0, var edge: Int = 0, var hdr: Int = 100)
+class Profile(var exp: Int = 0, var nr: Int = 0, var edge: Int = 0, var hdr: Int = 50)
 
 /** Cuadrícula de tercios sobre el visor. */
 class GridOverlay(ctx: Context) : View(ctx) {
@@ -146,6 +146,8 @@ private fun fmtT(ns: Long): String =
     if (ns >= 1_000_000_000L) "%.0f s".format(ns / 1e9) else "1/${(1e9 / ns).roundToInt()} s"
 
 private val GREEN = Color.rgb(0, 224, 150)
+/** Máximo que pone la cámara stock (1000 nits / 203 nits), medido en sus fotos. */
+private const val STOCK_UHDR_MAX = 4.93f
 private val DARK = Color.argb(200, 40, 40, 40)
 
 class MainActivity : Activity(), SensorEventListener {
@@ -173,11 +175,6 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var thumb: ImageView
     private lateinit var shutterInner: View
     private lateinit var settingsSheet: FrameLayout
-    private lateinit var nrGroup: RadioGroup
-    private lateinit var edgeGroup: RadioGroup
-    private lateinit var hdrBar: SeekBar
-    private lateinit var hdrLabel: TextView
-    private lateinit var sheetLensLabel: TextView
     private lateinit var prefs: SharedPreferences
     private var suppress = false
     private val main = Handler(Looper.getMainLooper())
@@ -186,16 +183,17 @@ class MainActivity : Activity(), SensorEventListener {
     // ------------------------------------------------------------------ modos y ajustes
     private var lens = Lens.MAIN
     private var lastBackLens = Lens.MAIN
-    private var mode = Mode.STOCK
+    private var mode = Mode.FOTO
     private val videoMode get() = mode == Mode.VIDEO
     private val nightMode get() = mode == Mode.NOCHE
-    private val stockMode get() = mode == Mode.STOCK
+    private val stockMode get() = mode == Mode.FOTO
     /** Toma en curso del modo Stock (null si no hay). */
     @Volatile private var stockShot: StockShot? = null
+    /** La sesión actual entrega Ultra HDR nativo (JPEG_R, el mismo mecanismo que la cámara stock). */
+    @Volatile private var jpegRActive = false
+    private val jpegRBlocked = mutableSetOf<String>()
     private fun busy() = merger != null || stockShot != null
     private var physicalMode = false
-    /** Formato de archivo Ultra HDR (JPEG con gain map). */
-    private var ultraHdr = true
     private var nightFrames = 15
     /** Protección de luces altas en pasos de 1/3 EV (0..9). */
     private var hlSteps = 3
@@ -209,10 +207,6 @@ class MainActivity : Activity(), SensorEventListener {
     private var v60 = false
     private var activeSlider = 0 // 0 ninguno, 1 EV, 2 luces altas, 3 tiempo
 
-    private var vMfnr = false
-    private var vShdr = false
-    private var vZsl = false
-    private var vMoto = false
     private var vendorKeys: Set<String> = emptySet()
     private var vendorLog = ""
     private var sessionNote = ""
@@ -275,9 +269,6 @@ class MainActivity : Activity(), SensorEventListener {
 
     // RAW
     private var rawReader: ImageReader? = null
-    private var rawOn = true
-    /** Curva y color medidos de la cámara stock de Motorola (solo en el revelado RAW). */
-    private var stockLook = true
     @Volatile private var rawSupported = false
     private var rawInfo: RawInfo? = null
     private var shadingMapOk = false
@@ -298,23 +289,20 @@ class MainActivity : Activity(), SensorEventListener {
         Lens.values().forEach { l ->
             profiles[l] = Profile(
                 prefs.getInt("${l.name}_exp", 0),
-                prefs.getInt("${l.name}_nr2", 0),
-                prefs.getInt("${l.name}_edge2", 0),
-                prefs.getInt("${l.name}_hdr2", 100)
+                0,
+                0,
+                prefs.getInt("${l.name}_hdr4", 50).coerceIn(0, 100)
             )
         }
-        mode = Mode.values().getOrNull(prefs.getInt("mode3", Mode.STOCK.ordinal)) ?: Mode.STOCK
-        ultraHdr = prefs.getBoolean("ultraHdr", true)
+        mode = Mode.values().getOrNull(prefs.getInt("mode4", Mode.FOTO.ordinal)) ?: Mode.FOTO
         nightFrames = prefs.getInt("nightFrames", 15).let { if (it in listOf(10, 15, 20)) it else 15 }
-        hlSteps = prefs.getInt("hlSteps", 3).coerceIn(0, 9)
+        hlSteps = 3 // protección fija de 1 EV para la ráfaga de Noche
         shutterIdx = prefs.getInt("shutterIdx", 0).coerceIn(0, SHUTTER_NS.size - 1)
         awbIdx = prefs.getInt("awbIdx", 0).coerceIn(0, AWB_MODES.size - 1)
         timerIdx = prefs.getInt("timerIdx", 0).coerceIn(0, TIMERS.size - 1)
         gridOn = prefs.getBoolean("grid", true)
         v4k = prefs.getBoolean("v4k", false)
         v60 = prefs.getBoolean("v60", false)
-        rawOn = prefs.getBoolean("rawOn", true)
-        stockLook = prefs.getBoolean("stockLook", true)
 
         val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         frontId = try {
@@ -379,13 +367,12 @@ class MainActivity : Activity(), SensorEventListener {
         val e = prefs.edit()
         profiles.forEach { (l, p) ->
             e.putInt("${l.name}_exp", p.exp).putInt("${l.name}_nr2", p.nr)
-                .putInt("${l.name}_edge2", p.edge).putInt("${l.name}_hdr2", p.hdr)
+                .putInt("${l.name}_edge2", p.edge).putInt("${l.name}_hdr4", p.hdr)
         }
-        e.putInt("mode3", mode.ordinal).putBoolean("ultraHdr", ultraHdr).putInt("nightFrames", nightFrames)
+        e.putInt("mode4", mode.ordinal).putInt("nightFrames", nightFrames)
             .putInt("hlSteps", hlSteps).putInt("shutterIdx", shutterIdx).putInt("awbIdx", awbIdx)
             .putInt("timerIdx", timerIdx).putBoolean("grid", gridOn)
-            .putBoolean("v4k", v4k).putBoolean("v60", v60).putBoolean("rawOn", rawOn)
-            .putBoolean("stockLook", stockLook)
+            .putBoolean("v4k", v4k).putBoolean("v60", v60)
         e.apply()
     }
 
@@ -677,75 +664,23 @@ class MainActivity : Activity(), SensorEventListener {
         }
         col.addView(header)
 
-        sheetLensLabel = sheetLabel("").apply { typeface = Typeface.DEFAULT_BOLD; setTextColor(GREEN) }
-        col.addView(sheetLensLabel)
-        col.addView(sheetLabel("Reducción de ruido"))
-        nrGroup = radioRow(listOf("Auto", "Off", "Rápido", "Alta"), -1) { prof().nr = it; save(); updatePreview() }
-        col.addView(nrGroup)
-        col.addView(sheetLabel("Nitidez"))
-        edgeGroup = radioRow(listOf("Auto", "Off", "Rápido", "Alta"), -1) { prof().edge = it; save(); updatePreview() }
-        col.addView(edgeGroup)
-        hdrLabel = sheetLabel("")
-        col.addView(hdrLabel)
-        hdrBar = seek(150) { p ->
-            prof().hdr = p
-            hdrLabel.text = "Intensidad Ultra HDR: $p%"
-            save()
-        }
-        col.addView(hdrBar)
-
-        col.addView(sheetLabel("Generales").apply { typeface = Typeface.DEFAULT_BOLD; setTextColor(GREEN) })
         col.addView(TextView(this).apply {
-            text = "Ajustar nivel Ultra HDR de fotos de la cámara stock  ›"
+            text = "Ajustar el Ultra HDR de fotos sacadas con la cámara de Motorola  ›"
             textSize = 15f
             setTextColor(Color.WHITE)
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setPadding(dp(16), dp(14), dp(16), dp(14))
             setOnClickListener { startActivity(Intent(this@MainActivity, HdrTunerActivity::class.java)) }
-        })
-        col.addView(Switch(this).apply {
-            text = "Estilo Motorola: curva y color de la cámara stock (RAW)"
-            setTextColor(Color.WHITE)
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            isChecked = stockLook
-            setOnCheckedChangeListener { _, c -> stockLook = c; save() }
         })
         col.addView(sheetLabel("Fotos por toma en modo Noche"))
         val opts = listOf(10, 15, 20)
         col.addView(radioRow(opts.map { "$it" }, opts.indexOf(nightFrames)) {
             nightFrames = opts[it]; save(); updateModeUi()
         })
-
-        col.addView(sheetLabel("Motor propio Qualcomm / Motorola (experimental)").apply { typeface = Typeface.DEFAULT_BOLD; setTextColor(GREEN) })
-        fun vendorSwitch(t: String, onSet: (Boolean) -> Unit) = col.addView(Switch(this).apply {
-            text = t
-            setTextColor(Color.WHITE)
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            setOnCheckedChangeListener { sw, checked ->
-                if (suppress) return@setOnCheckedChangeListener
-                onSet(checked)
-                if (checked) {
-                    riskySwitch = sw as Switch
-                    riskyName = t
-                    riskyRevert = { onSet(false) }
-                    okFrames = 0
-                }
-                if (device != null) startSession() else openCamera()
-            }
-        })
-        vendorSwitch("MFNR: ruido multi-frame") { vMfnr = it }
-        vendorSwitch("SHDR: HDR escalonado") { vShdr = it }
-        vendorSwitch("ZSL de Motorola") { vZsl = it }
-        vendorSwitch("Marcar cliente como Moto Camera") { vMoto = it }
-        col.addView(Switch(this).apply {
-            text = "Lente físico directo"
-            setTextColor(Color.WHITE)
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            setOnCheckedChangeListener { _, c ->
-                if (suppress) return@setOnCheckedChangeListener
-                physicalMode = c
-                if (device != null) startSession()
-            }
-        })
+        col.addView(sheetLabel(
+            "Foto: la procesa el chip de cámara con la afinación de Motorola (ruido, nitidez y color automáticos). " +
+                "El botón HDR elige cuánta luz agrega el Ultra HDR: 100 % es como la cámara stock, 0 % lo apaga.\n\n" +
+                "Noche: junta 10 a 20 fotos RAW para bajar el ruido; mantené quieto el celu."
+        ).apply { textSize = 13f; setTextColor(Color.LTGRAY) })
         settingsSheet.addView(ScrollView(this).apply { addView(col) })
     }
 
@@ -791,20 +726,6 @@ class MainActivity : Activity(), SensorEventListener {
                 if (!recording) { v60 = !v60; save(); rebuildTopBar(); restartVideo() }
             })
         } else {
-            if (!stockMode) add(circleBtn("RAW", 46) {
-                if (merger != null) return@circleBtn
-                rawOn = !rawOn; save(); rebuildTopBar()
-                say(when {
-                    !rawOn -> "RAW apagado: fusiono JPEG"
-                    rawSupported -> "RAW activado"
-                    else -> "RAW activado (se aplica al reabrir el lente)"
-                })
-                if (device != null) camHandler.post { startSession() }
-            }.apply { setOn(this, rawOn && rawSupported); if (rawOn && !rawSupported) setTextColor(Color.GRAY); textSize = 11f })
-            add(circleBtn("UHDR", 46) {
-                ultraHdr = !ultraHdr; save(); rebuildTopBar()
-                say(if (ultraHdr) "Ultra HDR activado" else "Ultra HDR desactivado: JPEG común")
-            }.apply { setOn(this, ultraHdr); textSize = 10f })
             if (nightMode) {
                 add(circleBtn("$nightFrames", 46) {
                     nightFrames = when (nightFrames) { 10 -> 15; 15 -> 20; else -> 10 }
@@ -837,9 +758,9 @@ class MainActivity : Activity(), SensorEventListener {
         }
         rebuildTopBar()
         btnHl.visibility = if (videoMode) View.GONE else View.VISIBLE
-        btnTime.visibility = if (videoMode || stockMode) View.GONE else View.VISIBLE
-        btnHl.text = if (stockMode) "HDR" else "LUZ"
-        if (stockMode && activeSlider == 3) closeSlider()
+        btnTime.visibility = if (nightMode) View.VISIBLE else View.GONE
+        btnHl.text = "HDR"
+        if (!nightMode && activeSlider == 3) closeSlider()
         if (videoMode && activeSlider >= 2) closeSlider()
         updateQuickButtons()
         updateLensRow()
@@ -876,7 +797,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun updateQuickButtons() {
         setOn(btnEv, prof().exp != 0)
-        setOn(btnHl, if (stockMode) ultraHdr && prof().hdr != 100 else hlSteps != 3)
+        setOn(btnHl, prof().hdr != 50)
         setOn(btnTime, shutterIdx != 0)
         btnTime.text = if (shutterIdx == 0) "1/s" else fmtT(SHUTTER_NS[shutterIdx]).replace(" s", "")
         btnTime.textSize = if (shutterIdx == 0) 12f else 10f
@@ -889,7 +810,7 @@ class MainActivity : Activity(), SensorEventListener {
         activeSlider = kind
         when (kind) {
             1 -> { sliderBar.max = 72; sliderBar.progress = prof().exp + 36 }
-            2 -> if (stockMode) { sliderBar.max = 150; sliderBar.progress = prof().hdr } else { sliderBar.max = 9; sliderBar.progress = hlSteps }
+            2 -> { sliderBar.max = 100; sliderBar.progress = prof().hdr }
             3 -> { sliderBar.max = SHUTTER_NS.size - 1; sliderBar.progress = shutterIdx }
         }
         sliderLabel.text = sliderText()
@@ -904,7 +825,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun onSlider(p: Int) {
         when (activeSlider) {
             1 -> { prof().exp = p - 36; save(); updatePreview() }
-            2 -> { if (stockMode) prof().hdr = p else hlSteps = p; save() }
+            2 -> { prof().hdr = p; save() }
             3 -> { shutterIdx = p; save() }
         }
         sliderLabel.text = sliderText()
@@ -913,11 +834,15 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun sliderText(): String = when (activeSlider) {
         1 -> "Exposición (${lens.label}): %+.1f EV".format(prof().exp / 6f)
-        2 -> if (stockMode) {
-            if (!ultraHdr) "Ultra HDR apagado (botón UHDR arriba)"
-            else "Nivel Ultra HDR (${lens.label}): ${prof().hdr}% · luces hasta ×%.1f".format(stockBoost())
-        } else "Protección de luces altas: %.1f EV".format(hlSteps / 3f) +
-            if (hlSteps == 0) "\nsin margen: no se genera Ultra HDR" else ""
+        2 -> {
+            val h = prof().hdr
+            // ojo: sin String.format sobre el texto con "%" (ese era el cierre de la app)
+            "Ultra HDR (" + lens.label + "): " + h + " %  ·  " + when {
+                h == 0 -> "apagado"
+                h == 100 -> "como la cámara stock"
+                else -> "luces hasta ×" + String.format(Locale.US, "%.1f", stockBoost())
+            }
+        }
         3 -> {
             val ns = SHUTTER_NS[shutterIdx]
             if (ns == 0L) "Tiempo por foto: automático"
@@ -928,16 +853,7 @@ class MainActivity : Activity(), SensorEventListener {
         else -> ""
     }
 
-    private fun refreshControls() {
-        val p = prof()
-        suppress = true
-        (nrGroup.getChildAt(p.nr) as RadioButton).isChecked = true
-        (edgeGroup.getChildAt(p.edge) as RadioButton).isChecked = true
-        hdrBar.progress = p.hdr
-        hdrLabel.text = "Intensidad Ultra HDR: ${p.hdr}%"
-        sheetLensLabel.text = "Lente actual: ${if (lens.front) "frontal" else lens.label} (se guarda por lente)"
-        suppress = false
-    }
+    private fun refreshControls() {}
 
     // ------------------------------------------------------------------ mensajes e información
 
@@ -957,9 +873,7 @@ class MainActivity : Activity(), SensorEventListener {
         val what = when {
             videoMode -> "video ${videoSize.height}p $videoFps fps"
             nightMode -> "noche, $nightFrames fotos"
-            stockMode -> "stock + Ultra HDR ${if (ultraHdr) "${prof().hdr}%" else "apagado"}"
-            mode == Mode.MEJORADO -> "HDR mejorado, 15 fotos"
-            else -> "HDR activo, 8 fotos"
+            else -> "foto del chip + Ultra HDR ${prof().hdr} %" + if (jpegRActive) " (nativo)" else ""
         }
         return "${if (lens.front) "Frontal" else lens.label} · $where · $what"
     }
@@ -1204,6 +1118,8 @@ class MainActivity : Activity(), SensorEventListener {
             rawReader = null
             rawSupported = false
             rawInfo = null
+            jpegRActive = false
+            hlgSurface = null
             try { recSurface?.release() } catch (_: Exception) {}
             recSurface = null
             sessionNote = ""
@@ -1256,24 +1172,32 @@ class MainActivity : Activity(), SensorEventListener {
                 surfaces += ps
                 surfaces += rs
             } else {
-                // En Stock se pide el tamaño completo (el tele llega a 4624x3468, como la cámara stock)
-                val ss = pickSize(map.getOutputSizes(ImageFormat.JPEG), 4, 3, if (stockMode) 4640 else 4096)!!
+                sessKey = "$camId/${if (usePhysical) lens.physicalId else "L"}/${lens.name}"
+                // Foto: Ultra HDR nativo (JPEG_R) si el sistema lo ofrece; si no, JPEG común + gain map propio
+                val useR = stockMode && sessKey !in jpegRBlocked && supportsJpegR(chars, map)
+                val fmt = if (useR) ImageFormat.JPEG_R else ImageFormat.JPEG
+                // tamaño completo del sensor (el tele llega a 4624x3468, como la cámara stock)
+                val ss = pickSize(map.getOutputSizes(fmt), 4, 3, if (stockMode) 4640 else 4096)!!
                 val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), 4, 3, 1440)!!
                 st.setDefaultBufferSize(prev.width, prev.height)
                 val ps = Surface(st)
                 previewSurface = ps
-                val r = ImageReader.newInstance(ss.width, ss.height, ImageFormat.JPEG, 8)
+                val r = ImageReader.newInstance(ss.width, ss.height, fmt, 4)
                 r.setOnImageAvailableListener({ rd -> onStill(rd) }, camHandler)
                 reader = r
                 surfaces += ps
                 surfaces += r.surface
-                sessKey = "$camId/${if (usePhysical) lens.physicalId else "L"}/${lens.name}"
-                if (!stockMode && rawOn && sessKey !in rawBlocked) setupRaw(chars, map)?.let { surfaces += it }
+                jpegRActive = useR
+                if (useR) hlgSurface = r.surface
+                if (nightMode && sessKey !in rawBlocked) setupRaw(chars, map)?.let { surfaces += it }
             }
             runOnUiThread { if (!videoMode) rebuildTopBar() }
 
             val outs = surfaces.map { s ->
-                OutputConfiguration(s).also { if (usePhysical) it.setPhysicalCameraId(lens.physicalId) }
+                OutputConfiguration(s).also {
+                    if (usePhysical) it.setPhysicalCameraId(lens.physicalId)
+                    if (s === hlgSurface) it.setDynamicRangeProfile(android.hardware.camera2.params.DynamicRangeProfiles.HLG10)
+                }
             }
             val cfg = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR, outs, executor,
@@ -1283,6 +1207,12 @@ class MainActivity : Activity(), SensorEventListener {
                         updatePreview()
                     }
                     override fun onConfigureFailed(s: CameraCaptureSession) {
+                        if (jpegRActive) {
+                            jpegRBlocked += sessKey
+                            say("Ultra HDR nativo no disponible en este lente: uso el de la app")
+                            camHandler.post { startSession() }
+                            return
+                        }
                         if (rawReader != null) {
                             rawBlocked += sessKey
                             say("Este lente no acepta RAW junto al visor: sigo con JPEG")
@@ -1295,13 +1225,23 @@ class MainActivity : Activity(), SensorEventListener {
             )
             val sp = d.createCaptureRequest(repeatingTemplate())
             if (videoMode) sp.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
-            applyVendor(sp)
             cfg.setSessionParameters(sp.build())
             d.createCaptureSession(cfg)
         } catch (e: Exception) {
             say("Sesión: ${e.javaClass.simpleName} ${e.message}")
         }
     }
+
+    private var hlgSurface: Surface? = null
+
+    /** ¿El lente puede entregar Ultra HDR nativo? Necesita salida de 10 bits HLG y el formato JPEG_R. */
+    private fun supportsJpegR(chars: CameraCharacteristics, map: android.hardware.camera2.params.StreamConfigurationMap): Boolean = try {
+        val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+        val tenBit = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_DYNAMIC_RANGE_TEN_BIT)
+        val hlg = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)?.supportedProfiles
+            ?.contains(android.hardware.camera2.params.DynamicRangeProfiles.HLG10) == true
+        tenBit && hlg && !map.getOutputSizes(ImageFormat.JPEG_R).isNullOrEmpty()
+    } catch (_: Exception) { false }
 
     /** Prepara el lector RAW si el lente lo permite. Devuelve su superficie o null. */
     private fun setupRaw(chars: CameraCharacteristics, map: android.hardware.camera2.params.StreamConfigurationMap): Surface? {
@@ -1369,7 +1309,6 @@ class MainActivity : Activity(), SensorEventListener {
         if (p.edge > 0) b.set(CaptureRequest.EDGE_MODE, p.edge - 1)
         b.set(CaptureRequest.CONTROL_ZOOM_RATIO, if (usePhysical || lens.front) 1f else lens.zoom)
         if (videoMode) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
-        applyVendor(b)
         return b
     }
 
@@ -1414,28 +1353,6 @@ class MainActivity : Activity(), SensorEventListener {
 
     // ------------------------------------------------------------------ claves propias
 
-    private fun setVendor(b: CaptureRequest.Builder, name: String, v: Int): String {
-        if (name !in vendorKeys) return "no existe"
-        try { b.set(CaptureRequest.Key<Byte>(name, Byte::class.javaObjectType), v.toByte()); return "ok(byte)" } catch (_: Exception) {}
-        try { b.set(CaptureRequest.Key<Int>(name, Int::class.javaObjectType), v); return "ok(int)" } catch (_: Exception) {}
-        try { b.set(CaptureRequest.Key<IntArray>(name, IntArray::class.java), intArrayOf(v)); return "ok(int[])" } catch (_: Exception) {}
-        return "tipo no compatible"
-    }
-
-    private fun applyVendor(b: CaptureRequest.Builder) {
-        val q = "org.codeaurora.qcamera3.sessionParameters."
-        val m = "com.lenovo.moto."
-        val log = StringBuilder()
-        fun go(on: Boolean, label: String, key: String) {
-            if (on) log.append("\n$label: ${setVendor(b, key, 1)}")
-        }
-        go(vMfnr, "MFNR", q + "enableMFNR")
-        go(vShdr, "SHDR", q + "EnableSHDR")
-        go(vZsl, "ZSL Moto", m + "control.capture_zsl_mode")
-        go(vMoto, "Cliente Moto", m + "clientapp.is_motcamera2")
-        vendorLog = log.toString()
-    }
-
     // ------------------------------------------------------------------ disparador
 
     private fun onShutter() {
@@ -1461,15 +1378,14 @@ class MainActivity : Activity(), SensorEventListener {
     private fun shoot() {
         countdown = 0
         when (mode) {
-            Mode.STOCK -> shootStock()
             Mode.NOCHE -> startMerge(nightFrames, true)
-            Mode.MEJORADO -> startMerge(15, false)
-            else -> startMerge(8, false)
+            else -> shootStock()
         }
     }
 
     private fun onStill(rd: ImageReader) {
         val img = rd.acquireNextImage() ?: return
+        val ts = img.timestamp
         val bytes = try {
             val buf = img.planes[0].buffer
             ByteArray(buf.remaining()).also { buf.get(it) }
@@ -1477,7 +1393,7 @@ class MainActivity : Activity(), SensorEventListener {
             img.close()
         }
         val st = stockShot
-        if (st != null) { st.offer(bytes); return }
+        if (st != null) { st.offer(bytes, ts); return }
         val m = merger
         if (m != null && m.accepting()) m.offer(bytes)
     }
@@ -1485,27 +1401,32 @@ class MainActivity : Activity(), SensorEventListener {
     // ------------------------------------------------------------------ modo Stock
 
     /** Brillo máximo de las luces con el nivel elegido: 100 % = ×4 (2 pasos), 150 % = ×8, 50 % = ×2. */
-    private fun stockBoost(): Float = 2f.pow(2f * prof().hdr / 100f)
+    /** Máximo del Ultra HDR para el nivel elegido: 100 % = ×4.93 como la stock, 50 % = ×2.2, 0 % = sin HDR. */
+    private fun stockBoost(): Float = STOCK_UHDR_MAX.pow(prof().hdr / 100f)
 
     /**
-     * Una foto normal procesada por el celu (exposición, ruido, nitidez y color del fabricante) y, si Ultra HDR
-     * está activo, otra igual 3 pasos más oscura para medir las luces y armar el gain map.
+     * Foto: una toma procesada por el chip de cámara (exposición, ruido, nitidez y color de Motorola).
+     *  - Con Ultra HDR nativo (JPEG_R) el sistema arma el gain map como la cámara stock; después solo se ajusta
+     *    su intensidad sin tocar la imagen (UltraHdrTuner).
+     *  - Si no, se saca además una toma 3 pasos más oscura para medir las luces y armar el gain map en la app.
      */
     private fun shootStock() {
         val s = session ?: return say("Cámara no lista")
         val target = reader?.surface ?: return say("Cámara no lista")
         val boost = stockBoost()
-        val wantHdr = ultraHdr && prof().hdr > 0
+        val native = jpegRActive
         val t0 = lastT
         val iso0 = lastIso
-        val under = wantHdr && t0 > 0L && iso0 > 0
+        val under = !native && prof().hdr > 0 && t0 > 0L && iso0 > 0
         try {
-            val shot = StockShot(if (under) 2 else 1, boost, lens.name)
+            val shot = StockShot(if (under) 2 else 1, boost, prof().hdr, native, lens.name)
             stockShot = shot
             val orient = sensorOrientation
             val normal = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(target)).apply {
                 set(CaptureRequest.JPEG_ORIENTATION, orient)
                 set(CaptureRequest.JPEG_QUALITY, 97.toByte())
+                set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_HIGH_QUALITY)
                 setTag("sdr")
             }.build()
             val reqs = mutableListOf(normal)
@@ -1529,35 +1450,42 @@ class MainActivity : Activity(), SensorEventListener {
                     shot.onResult(req.tag as? String, res)
                 }
                 override fun onCaptureFailed(ses: CameraCaptureSession, req: CaptureRequest, f: CaptureFailure) {
-                    shot.onFailed(req.tag as? String)
+                    shot.onFailed()
                 }
             }, camHandler)
             camHandler.postDelayed({ if (stockShot === shot) shot.giveUp() }, 8_000L)
-            say(if (under) "Foto stock + toma para Ultra HDR..." else "Foto stock...")
+            say(if (under) "Foto + toma para el Ultra HDR..." else "Foto...")
         } catch (e: Exception) {
             stockShot = null
-            say("Stock: ${e.javaClass.simpleName} ${e.message}")
+            say("Foto: ${e.javaClass.simpleName} ${e.message}")
         }
     }
 
-    private inner class StockShot(val expected: Int, val boost: Float, val lensName: String) {
-        private var sdr: ByteArray? = null
-        private var under: ByteArray? = null
-        private var got = 0
+    private inner class StockShot(
+        val expected: Int,
+        val boost: Float,
+        val level: Int,
+        val native: Boolean,
+        val lensName: String
+    ) {
+        /** Imágenes recibidas con su marca de tiempo del sensor (para saber cuál es cuál). */
+        private val frames = java.util.Collections.synchronizedList(mutableListOf<Pair<Long, ByteArray>>())
+        private val tagByTs = java.util.concurrent.ConcurrentHashMap<Long, String>()
+        @Volatile private var got = 0
         @Volatile private var sdrExposure = 0.0
         @Volatile private var underExposure = 0.0
         @Volatile private var sdrInfo = ""
         @Volatile private var done = false
 
-        /** Las imágenes llegan en el mismo orden que los pedidos de la ráfaga: primero la normal. */
-        fun offer(bytes: ByteArray) {
+        fun offer(bytes: ByteArray, ts: Long) {
             if (done) return
-            if (got == 0) sdr = bytes else under = bytes
+            frames += ts to bytes
             got++
             if (got >= expected) finish()
         }
 
         fun onResult(tag: String?, r: TotalCaptureResult) {
+            r.get(CaptureResult.SENSOR_TIMESTAMP)?.let { if (tag != null) tagByTs[it] = tag }
             val t = r.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
             val iso = r.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
             val boostRaw = (r.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100) / 100.0
@@ -1565,8 +1493,9 @@ class MainActivity : Activity(), SensorEventListener {
             if (tag == "under") underExposure = e else { sdrExposure = e; sdrInfo = "${fmtT(t)} · ISO $iso" }
         }
 
-        fun onFailed(tag: String?) {
-            if (tag == "under") { got++; if (got >= expected) finish() }
+        fun onFailed() {
+            got++
+            if (got >= expected) finish()
         }
 
         fun giveUp() { if (!done) finish() }
@@ -1574,37 +1503,54 @@ class MainActivity : Activity(), SensorEventListener {
         private fun finish() {
             if (done) return
             done = true
-            val s = sdr
-            val u = under
             mergeExec.execute {
                 val started = System.currentTimeMillis()
+                var sdr: ByteArray? = null
                 try {
-                    if (s == null) { say("No llegó la foto"); return@execute }
-                    val name = "IMG_${stamp()}_${lensName}_STOCK"
                     // Esperar un poco los metadatos de la toma (suelen llegar junto con la imagen)
                     var waited = 0
-                    while ((sdrExposure == 0.0 || (u != null && underExposure == 0.0)) && waited < 1000) { Thread.sleep(20); waited += 20 }
-                    val ratio = if (u != null && underExposure > 0.0 && sdrExposure > 0.0) (sdrExposure / underExposure).toFloat() else 0f
-                    val out = if (u != null && ratio > 1f) withGainMap(s, u, ratio) else null
-                    val bytes = out ?: s
-                    val uri = saveImage(bytes, "$name.jpg")
-                    if (uri != null) { lastUri = uri; lastMime = "image/jpeg" }
-                    setThumb(BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 16 }))
-                    val secs = (System.currentTimeMillis() - started) / 1000.0
-                    lastShotInfo = "Última: STOCK · $sdrInfo\n" + when {
-                        out != null -> "Ultra HDR: luces hasta ×%.1f · toma oscura ×%.1f menos luz · %.1f s".format(boost, ratio, secs)
-                        u != null && ratio > 1f -> "Sin luces que realzar: JPEG del celu sin tocar"
-                        ultraHdr -> "Ultra HDR no disponible en esta toma: JPEG del celu sin tocar"
-                        else -> "Ultra HDR apagado: JPEG del celu sin tocar"
+                    while ((sdrExposure == 0.0 || (expected > 1 && underExposure == 0.0)) && waited < 1000) { Thread.sleep(20); waited += 20 }
+                    val list = synchronized(frames) { frames.toList() }
+                    sdr = list.firstOrNull { tagByTs[it.first] == "sdr" }?.second ?: list.firstOrNull()?.second
+                    val under = list.firstOrNull { tagByTs[it.first] == "under" }?.second
+                        ?: list.firstOrNull { it.second !== sdr }?.second
+                    val s = sdr ?: run { say("No llegó la foto"); return@execute }
+                    val name = "IMG_${stamp()}_${lensName}"
+                    var how: String
+                    val out: ByteArray = if (native) {
+                        // Ultra HDR del sistema: solo se ajusta la intensidad, sin tocar la imagen ni el EXIF
+                        val info = UltraHdrTuner.analyze(s)
+                        if (info == null) { how = "JPEG del chip (el sistema no agregó Ultra HDR en esta escena)"; s }
+                        else if (level >= 100) { how = "Ultra HDR nativo ×%.2f, como la stock".format(info.maxBoost); s }
+                        else {
+                            val tb = Math.pow(info.maxBoost, level / 100.0)
+                            how = "Ultra HDR nativo: ×%.2f → ×%.2f (%d %%)".format(info.maxBoost, tb, level)
+                            UltraHdrTuner.setMaxBoost(s, tb) ?: s
+                        }
+                    } else {
+                        val ratio = if (under != null && underExposure > 0.0 && sdrExposure > 0.0) (sdrExposure / underExposure).toFloat() else 0f
+                        val g = if (under != null && ratio > 1f) withGainMap(s, under, ratio) else null
+                        how = when {
+                            g != null -> "Ultra HDR de la app: luces hasta ×%.1f (toma oscura ×%.1f menos luz)".format(boost, ratio)
+                            level == 0 -> "Ultra HDR apagado: JPEG del chip sin tocar"
+                            under != null && ratio > 1f -> "Sin luces que realzar: JPEG del chip sin tocar"
+                            else -> "No se pudo armar el Ultra HDR: JPEG del chip sin tocar"
+                        }
+                        g ?: s
                     }
+                    val uri = saveImage(out, "$name.jpg")
+                    if (uri != null) { lastUri = uri; lastMime = "image/jpeg" }
+                    setThumb(BitmapFactory.decodeByteArray(out, 0, out.size, BitmapFactory.Options().apply { inSampleSize = 16 }))
+                    val secs = (System.currentTimeMillis() - started) / 1000.0
+                    lastShotInfo = "Última: FOTO · $sdrInfo\n$how · %.1f s".format(secs)
                     refreshInfo()
-                    say(if (out != null) "Guardada (stock + Ultra HDR)" else "Guardada (stock)")
+                    say("Guardada")
                 } catch (t: Throwable) {
-                    // Ante cualquier problema con el gain map se guarda la foto del celu tal cual
-                    try { if (s != null) saveImage(s, "IMG_${stamp()}_${lensName}_STOCK.jpg") } catch (_: Throwable) {}
+                    // Ante cualquier problema se guarda la foto del chip tal cual
+                    try { sdr?.let { saveImage(it, "IMG_${stamp()}_${lensName}.jpg") } } catch (_: Throwable) {}
                     say("Ultra HDR: ${t.javaClass.simpleName} ${t.message}")
                 } finally {
-                    sdr = null; under = null
+                    frames.clear()
                     if (stockShot === this) stockShot = null
                 }
             }
@@ -1664,7 +1610,7 @@ class MainActivity : Activity(), SensorEventListener {
      */
     private fun startMerge(n: Int, night: Boolean) {
         val s = session ?: return say("Cámara no lista")
-        val useRaw = rawOn && rawSupported && rawReader != null
+        val useRaw = rawSupported && rawReader != null
         val target = (if (useRaw) rawReader else reader)?.surface ?: return say("Cámara no lista")
         val t0 = lastT
         val iso0 = lastIso
@@ -1690,9 +1636,9 @@ class MainActivity : Activity(), SensorEventListener {
             val iso = (p / t).roundToInt().coerceIn(isoMin, isoMax)
             val motionNote = "pulso %.1f°/s%s".format(Math.toDegrees(omega.toDouble()), if (steady) " (apoyado)" else "")
 
-            val tag = when (mode) { Mode.NOCHE -> "NOCHE"; Mode.MEJORADO -> "HDRM"; else -> "HDR" }
-            val m = Merger(n, u, night, ultraHdr, prof().hdr / 100f, tag, lens.name, t, iso,
-                if (useRaw) rawInfo else null, prof().exp / 6f, motionNote, prof().edge, prof().nr, stockLook)
+            val tag = "NOCHE"
+            val m = Merger(n, u, night, prof().hdr > 0, prof().hdr / 100f, tag, lens.name, t, iso,
+                if (useRaw) rawInfo else null, prof().exp / 6f, motionNote, 0, 0, true)
             merger = m
 
             val reqs = List(n) {
