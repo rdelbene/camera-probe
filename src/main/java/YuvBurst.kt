@@ -382,9 +382,9 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
     val shift = (medOut.coerceAtMost(-1.6f) - med).coerceIn(-1f, 4f)
     // luces: hombro arriba de K; solo se comprime lo que no entra (ventanas, cielo), los medios quedan como están
     val knee = -1.3f // ~0.4 lineal (~170)
-    val hiOut = -0.25f // la iluminación más alta queda en ~0.84 lineal; el detalle encima entra en el hombro de salida
+    val hiOut = -0.55f // la iluminación más alta queda en ~0.68 lineal (~215, como la stock); el detalle encima entra en el hombro
     val hiS = hi + shift
-    val cHi = if (hiS > hiOut && hiS > knee + 0.1f) (1f - strength * (1f - ((hiOut - knee) / (hiS - knee)).coerceIn(0.3f, 1f))) else 1f
+    val cHi = if (hiS > hiOut && hiS > knee + 0.1f) (1f - strength * (1f - ((hiOut - knee) / (hiS - knee)).coerceIn(0.15f, 1f))) else 1f
     // sombras: suba extra suave (las zonas oscuras se acercan un poco a la mediana)
     val cLo = if (med - lo > 0.1f) (1f - strength * (1f - (rangeTarget / (med - lo)).coerceIn(0.6f, 1f))) else 1f
     // aplicar a resolución completa (a y b interpolados); se guarda la suba de cada pixel (pasos × 64)
@@ -453,10 +453,11 @@ fun YuvMerger.resultPlanes(): Triple<FloatArray, ByteArray, ByteArray> {
  */
 fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exposureComp: Float, maxLift: Float, noiseSigma: Float = 0f, refMedianLuma: Float = 0f): Pair<IntArray, Float> {
     val old = y.copyOf()
-    val lift = localToneMap(y, w, h, 1f, 4.5f, maxLift, exposureComp, noiseSigma, 0.3f, refMedianLuma)
+    val lift = localToneMap(y, w, h, 1f, 4.5f, maxLift, exposureComp, noiseSigma, -0.15f, refMedianLuma)
     val cw = (w + 1) / 2
     val out = IntArray(w * h)
-    val kLut = FloatArray(1025) { Math.pow(it / 256.0, 0.7).toFloat().coerceIn(0.5f, 4f) } // relación 0..4
+    // relación 0..4; ×1.15 de saturación (la stock tiene más color que el YUV del chip)
+    val kLut = FloatArray(1025) { 1.15f * Math.pow(it / 256.0, 0.7).toFloat().coerceIn(0.5f, 4f) }
     for (yy in 0 until h) {
         val crow = (yy shr 1) * cw
         for (xx in 0 until w) {
