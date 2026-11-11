@@ -268,6 +268,8 @@ class MainActivity : Activity(), SensorEventListener {
     // RAW
     private var rawReader: ImageReader? = null
     private var rawOn = true
+    /** Curva y color medidos de la cámara stock de Motorola (solo en el revelado RAW). */
+    private var stockLook = true
     @Volatile private var rawSupported = false
     private var rawInfo: RawInfo? = null
     private var shadingMapOk = false
@@ -304,6 +306,7 @@ class MainActivity : Activity(), SensorEventListener {
         v4k = prefs.getBoolean("v4k", false)
         v60 = prefs.getBoolean("v60", false)
         rawOn = prefs.getBoolean("rawOn", true)
+        stockLook = prefs.getBoolean("stockLook", true)
 
         val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         frontId = try {
@@ -374,6 +377,7 @@ class MainActivity : Activity(), SensorEventListener {
             .putInt("hlSteps", hlSteps).putInt("shutterIdx", shutterIdx).putInt("awbIdx", awbIdx)
             .putInt("timerIdx", timerIdx).putBoolean("grid", gridOn)
             .putBoolean("v4k", v4k).putBoolean("v60", v60).putBoolean("rawOn", rawOn)
+            .putBoolean("stockLook", stockLook)
         e.apply()
     }
 
@@ -681,6 +685,13 @@ class MainActivity : Activity(), SensorEventListener {
         col.addView(hdrBar)
 
         col.addView(sheetLabel("Generales").apply { typeface = Typeface.DEFAULT_BOLD; setTextColor(GREEN) })
+        col.addView(Switch(this).apply {
+            text = "Estilo Motorola: curva y color de la cámara stock (RAW)"
+            setTextColor(Color.WHITE)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            isChecked = stockLook
+            setOnCheckedChangeListener { _, c -> stockLook = c; save() }
+        })
         col.addView(sheetLabel("Fotos por toma en modo Noche"))
         val opts = listOf(10, 15, 20)
         col.addView(radioRow(opts.map { "$it" }, opts.indexOf(nightFrames)) {
@@ -1480,7 +1491,7 @@ class MainActivity : Activity(), SensorEventListener {
 
             val tag = when (mode) { Mode.NOCHE -> "NOCHE"; Mode.MEJORADO -> "HDRM"; else -> "HDR" }
             val m = Merger(n, u, night, ultraHdr, prof().hdr / 100f, tag, lens.name, t, iso,
-                if (useRaw) rawInfo else null, prof().exp / 6f, motionNote)
+                if (useRaw) rawInfo else null, prof().exp / 6f, motionNote, prof().edge, prof().nr, stockLook)
             merger = m
 
             val reqs = List(n) {
@@ -1528,8 +1539,15 @@ class MainActivity : Activity(), SensorEventListener {
         val shotIso: Int,
         val raw: RawInfo?,
         val evComp: Float,
-        val motionNote: String
+        val motionNote: String,
+        /** Ajustes "Nitidez" y "Reducción de ruido" del lente: 0 auto, 1 off, 2 rápido, 3 alta. */
+        val sharp: Int,
+        val nrLevel: Int,
+        val look: Boolean
     ) {
+        /** Datos medidos de la stock para este lente (ruido, sombreado, color, estilo). */
+        private val stock = StockProfiles.forLens(lensName)
+        private var detailNote = ""
         @Volatile private var received = 0
         @Volatile private var expected = total
         @Volatile private var finished = false
@@ -1555,10 +1573,21 @@ class MainActivity : Activity(), SensorEventListener {
         private var sumG: ShortArray? = null
         private var sumB: ShortArray? = null
         private var refL: ByteArray? = null
-        // Acumuladores RAW
-        private var rawSum: IntArray? = null
+        // Acumuladores RAW: suma ponderada y suma de pesos (fusión según el modelo de ruido)
+        private var rawSum: FloatArray? = null
+        private var rawW: FloatArray? = null
         private var rawRef: ShortArray? = null
         private var cnt: ByteArray? = null
+
+        /** Modelo de ruido que informa el sensor para esta toma; si no lo informa, uno genérico según el ISO. */
+        private fun noiseModel(): NoiseModel {
+            val prof = firstResult?.get(CaptureResult.SENSOR_NOISE_PROFILE)
+            if (prof.isNullOrEmpty()) return stock.noiseModel(shotIso)
+            return NoiseModel(
+                FloatArray(4) { prof[min(it, prof.size - 1)].first.toFloat() },
+                FloatArray(4) { prof[min(it, prof.size - 1)].second.toFloat() }
+            )
+        }
 
         fun accepting() = !finished && received < expected
 
@@ -1704,28 +1733,34 @@ class MainActivity : Activity(), SensorEventListener {
             if (rawSum == null) {
                 w = fw; h = fh
                 val n = w * h
-                rawSum = IntArray(n); rawRef = ShortArray(n); cnt = ByteArray(n)
+                rawSum = FloatArray(n); rawW = FloatArray(n); rawRef = ShortArray(n)
             }
-            val sum = rawSum!!; val ref = rawRef!!; val c = cnt!!
-            val noise = range * (if (night) 0.06f else 0.035f)
+            val sum = rawSum!!; val wt = rawW!!; val ref = rawRef!!
+            // Varianza esperada en unidades crudas: S·range·(v-negro) + O·range², por canal del mosaico
+            val nm = noiseModel()
+            val sR = FloatArray(4) { nm.s[it] * range }
+            val oR = FloatArray(4) { nm.o[it] * range * range }
+            val k = if (night) 12f else 9f
             for (y in 0 until h) {
+                val py = (y and 1) * 2
                 for (x in 0 until w) {
                     val i = y * w + x
                     if (sm == null) {
                         val v = sbuf.get(y * rs + x).toInt() and 0xFFFF
                         ref[i] = v.toShort()
-                        sum[i] += v
-                        c[i] = (c[i] + 1).toByte()
+                        sum[i] = v.toFloat()
+                        wt[i] = 1f
                     } else {
                         val bi = sm.idx(x, y)
                         val sx = x + sm.dx[bi]
                         val sy = y + sm.dy[bi]
                         if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue
-                        val v = sbuf.get(sy * rs + sx).toInt() and 0xFFFF
-                        val rv = ref[i].toInt() and 0xFFFF
-                        if (abs(v - rv) > 0.15f * (rv - blackAvg).coerceAtLeast(0f) + noise) continue
-                        sum[i] += v
-                        c[i] = (c[i] + 1).toByte()
+                        val v = (sbuf.get(sy * rs + sx).toInt() and 0xFFFF).toFloat()
+                        val rv = (ref[i].toInt() and 0xFFFF).toFloat()
+                        val pos = py + (x and 1)
+                        val varDiff = 2f * (sR[pos] * (rv - blackAvg).coerceAtLeast(0f) + oR[pos])
+                        val wgt = mergeWeight(v - rv, varDiff, k)
+                        if (wgt > 0f) { sum[i] += wgt * v; wt[i] += wgt }
                     }
                 }
             }
@@ -1745,14 +1780,15 @@ class MainActivity : Activity(), SensorEventListener {
                 val tilesPct = if (tilesTotal > 0) 100 * tilesMoved / tilesTotal else 0
                 lastShotInfo = "Última: $tag ${if (raw != null) "RAW" else "JPEG"} · $merged/$total fotos · ${fmtT(shotT)} · ISO $shotIso\n" +
                     "desplaz. máx $maxShift px · zonas corregidas $tilesPct% · $motionNote\n" +
-                    "%.1f s de proceso · %s".format(secs, if (lastGain) "Ultra HDR" else "JPEG común")
+                    "%.1f s de proceso · %s".format(secs, if (lastGain) "Ultra HDR" else "JPEG común") +
+                    (if (detailNote.isNotEmpty()) "\n$detailNote" else "")
                 refreshInfo()
                 say("Guardada ($merged fotos${if (raw != null) " RAW" else ""})")
             } catch (t: Throwable) {
                 say("Fusión: ${t.javaClass.simpleName} ${t.message}")
             } finally {
                 sumR = null; sumG = null; sumB = null; refL = null
-                rawSum = null; rawRef = null; cnt = null
+                rawSum = null; rawW = null; rawRef = null; cnt = null
                 if (merger === this) merger = null
             }
         }
@@ -1790,19 +1826,25 @@ class MainActivity : Activity(), SensorEventListener {
                 gm = gainBytes(cell, gw, gh, g, tone)
             }
 
-            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            val row = IntArray(w)
-            for (y in 0 until h) {
-                val base = y * w
-                for (x in 0 until w) {
-                    val i = base + x
-                    val n = (c[i].toInt() and 255).coerceAtLeast(1)
-                    row[x] = (0xFF shl 24) or (toneLut[idx(sr[i], n)] shl 16) or
-                        (toneLut[idx(sg[i], n)] shl 8) or toneLut[idx(sb[i], n)]
-                }
-                bmp.setPixels(row, 0, w, 0, y, w, 1)
+            val px = IntArray(w * h)
+            for (i in 0 until w * h) {
+                val n = (c[i].toInt() and 255).coerceAtLeast(1)
+                px[i] = (0xFF shl 24) or (toneLut[idx(sr[i], n)] shl 16) or
+                    (toneLut[idx(sg[i], n)] shl 8) or toneLut[idx(sb[i], n)]
             }
             sumR = null; sumG = null; sumB = null; cnt = null; refL = null
+            // Los JPEG ya vienen con nitidez del procesador del celu: realce suave, sin limpieza de ruido
+            val dParams = when (sharp) {
+                1 -> null
+                3 -> DetailParams(1.25f, 1.35f, 1.1f, 0f, 0f)
+                else -> DetailParams(1.1f, 1.2f, 1.06f, 0f, 0f)
+            }
+            if (dParams != null) {
+                detailEnhance(px, w, h, dParams)
+                detailNote = "realce JPEG ×%.2f/×%.2f".format(dParams.gFine, dParams.gMid)
+            }
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            bmp.setPixels(px, 0, w, 0, 0, w, h)
             return encode(bmp, gm, gw, gh, g.pow(k))
         }
 
@@ -1811,21 +1853,20 @@ class MainActivity : Activity(), SensorEventListener {
             val ri = raw!!
             val res = firstResult
             val wbv = res?.get(CaptureResult.COLOR_CORRECTION_GAINS)
-            val wb = floatArrayOf(wbv?.red ?: 2f, wbv?.greenEven ?: 1f, wbv?.greenOdd ?: 1f, wbv?.blue ?: 1.6f)
+            val wb = floatArrayOf(wbv?.red ?: stock.wb[0], wbv?.greenEven ?: 1f, wbv?.greenOdd ?: 1f, wbv?.blue ?: stock.wb[2])
             val ccmT = res?.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
-            val ccm = FloatArray(9) { i -> ccmT?.getElement(i % 3, i / 3)?.toFloat() ?: if (i % 4 == 0) 1f else 0f }
+            val ccm = if (ccmT != null) FloatArray(9) { i -> ccmT.getElement(i % 3, i / 3).toFloat() } else stock.ccm()
             val black = res?.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL) ?: ri.black
             val white = (res?.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL) ?: ri.white).toFloat()
             val lsm = res?.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)
-            val sum = rawSum!!; val c = cnt!!
-            val n = w * h
+            val sum = rawSum!!; val wt = rawW!!
 
             // Sombreado del lente (viñeteo y color en las esquinas)
             val cols = lsm?.columnCount ?: 1
             val rows = lsm?.rowCount ?: 1
             val grids = Array(4) { ch -> FloatArray(cols * rows) { gi -> lsm?.getGainFactor(ch, gi % cols, gi / cols) ?: 1f } }
             fun shade(ch: Int, x: Int, y: Int): Float {
-                if (lsm == null) return 1f
+                if (lsm == null) return radialShading(stock.shadingCorner, x, y, w, h)
                 val gx = if (cols > 1) x * (cols - 1f) / (w - 1) else 0f
                 val gy = if (rows > 1) y * (rows - 1f) / (h - 1) else 0f
                 val x0 = gx.toInt().coerceAtMost(cols - 1); val x1 = (x0 + 1).coerceAtMost(cols - 1)
@@ -1837,19 +1878,21 @@ class MainActivity : Activity(), SensorEventListener {
                 return a * (1 - fy) + b * fy
             }
 
-            val plane = FloatArray(n)
+            // Se normaliza en el mismo arreglo de la suma para no ocupar otros 50 MB
             for (y in 0 until h) {
                 for (x in 0 until w) {
                     val i = y * w + x
                     val pos = (y and 1) * 2 + (x and 1)
                     val col = ri.cfa[pos]
                     val ch = when (col) { 0 -> 0; 2 -> 3; else -> if ((y and 1) == 0) 1 else 2 }
-                    val cn = (c[i].toInt() and 255).coerceAtLeast(1)
-                    val v = (sum[i].toFloat() / cn - black[pos]) / (white - black[pos])
-                    plane[i] = (v * shade(ch, x, y) * wb[ch]).coerceAtLeast(0f)
+                    val wv = wt[i]
+                    val avg = if (wv > 0f) sum[i] / wv else black[pos]
+                    val v = (avg - black[pos]) / (white - black[pos])
+                    sum[i] = (v * shade(ch, x, y) * wb[ch]).coerceAtLeast(0f)
                 }
             }
-            rawSum = null; rawRef = null; cnt = null
+            val plane = sum
+            rawSum = null; rawW = null; rawRef = null
 
             // Brillo automático (clave de la escena) y compensación del usuario
             var acc = 0.0
@@ -1885,51 +1928,23 @@ class MainActivity : Activity(), SensorEventListener {
             val wantGain = makeGain && bigG > 1.01f
             val cell = if (wantGain) FloatArray(gw * gh) else null
 
+            // Demosaico Malvar-He-Cutler + color + tono
+            val px = demosaicMhc(plane, w, h, ri.cfa, ccm, lut, cell, gw, gh)
+
+            // Ruido que queda tras la fusión, llevado a la salida (tono medio) para calibrar el realce
+            val nm = noiseModel()
+            val xm = (0.18f / bigG).coerceIn(0.002f, 0.5f)
+            val sigLin = nm.sigma(1, xm) / kotlin.math.sqrt(max(merged, 1).toFloat()) * 1.3f
+            val sigmaOut = (linToSrgb(tone(xm + sigLin)) - linToSrgb(tone(xm))).coerceIn(0f, 0.05f)
+            if (look) applyLook(px, stockToneLut(stock, 0.6f), stock.saturationAt(shotIso))
+            val dParams = detailParamsFor(sigmaOut, night, sharp, nrLevel, stock.sharpMul, stock.nrMul)
+            detailEnhance(px, w, h, dParams)
+            detailNote = "realce ×%.1f/×%.1f · ruido %.3f · %s%s%s".format(dParams.gFine, dParams.gMid, sigmaOut, stock.name,
+                if (look) " · estilo Motorola" else "",
+                (if (lsm == null) " · sombreado estimado" else "") + (if (ccmT == null) " · color de la stock" else ""))
+
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            val row = IntArray(w)
-            val cfa = ri.cfa
-            for (y in 0 until h) {
-                val ym = if (y > 0) y - 1 else 1
-                val yp = if (y < h - 1) y + 1 else h - 2
-                val rowY = y * w; val rowM = ym * w; val rowP = yp * w
-                for (x in 0 until w) {
-                    val xm = if (x > 0) x - 1 else 1
-                    val xp = if (x < w - 1) x + 1 else w - 2
-                    val v = plane[rowY + x]
-                    var r: Float; var g: Float; var b: Float
-                    when (cfa[(y and 1) * 2 + (x and 1)]) {
-                        1 -> {
-                            val hz = (plane[rowY + xm] + plane[rowY + xp]) * 0.5f
-                            val vt = (plane[rowM + x] + plane[rowP + x]) * 0.5f
-                            g = v
-                            if (cfa[(y and 1) * 2 + (xm and 1)] == 0) { r = hz; b = vt } else { r = vt; b = hz }
-                        }
-                        0 -> {
-                            r = v
-                            g = (plane[rowY + xm] + plane[rowY + xp] + plane[rowM + x] + plane[rowP + x]) * 0.25f
-                            b = (plane[rowM + xm] + plane[rowM + xp] + plane[rowP + xm] + plane[rowP + xp]) * 0.25f
-                        }
-                        else -> {
-                            b = v
-                            g = (plane[rowY + xm] + plane[rowY + xp] + plane[rowM + x] + plane[rowP + x]) * 0.25f
-                            r = (plane[rowM + xm] + plane[rowM + xp] + plane[rowP + xm] + plane[rowP + xp]) * 0.25f
-                        }
-                    }
-                    r = min(r, 1f); g = min(g, 1f); b = min(b, 1f)
-                    val ro = (ccm[0] * r + ccm[1] * g + ccm[2] * b).coerceIn(0f, 1f)
-                    val go = (ccm[3] * r + ccm[4] * g + ccm[5] * b).coerceIn(0f, 1f)
-                    val bo = (ccm[6] * r + ccm[7] * g + ccm[8] * b).coerceIn(0f, 1f)
-                    if (cell != null) {
-                        val gx = x shr 2; val gy = y shr 2
-                        if (gx < gw && gy < gh) cell[gy * gw + gx] += (0.2126f * ro + 0.7152f * go + 0.0722f * bo) / 16f
-                    }
-                    row[x] = (0xFF shl 24) or
-                        (lut[(kotlin.math.sqrt(ro) * 4095f).toInt()] shl 16) or
-                        (lut[(kotlin.math.sqrt(go) * 4095f).toInt()] shl 8) or
-                        lut[(kotlin.math.sqrt(bo) * 4095f).toInt()]
-                }
-                bmp.setPixels(row, 0, w, 0, y, w, 1)
-            }
+            bmp.setPixels(px, 0, w, 0, 0, w, h)
             val gm = if (cell != null) gainBytes(cell, gw, gh, bigG, tone) else null
             return encode(bmp, gm, gw, gh, bigG.pow(k))
         }
