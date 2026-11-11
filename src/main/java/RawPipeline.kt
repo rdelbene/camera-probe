@@ -266,7 +266,11 @@ fun detailEnhance(px: IntArray, w: Int, h: Int, p: DetailParams) {
             if (tf2 > 0f) dFine *= dFine * dFine / (dFine * dFine + tf2)
             var dMid = b1 - bb2
             if (tm2 > 0f) dMid *= dMid * dMid / (dMid * dMid + tm2)
-            val yNew = bb4 + p.gCoarse * (bb2 - bb4) + p.gMid * dMid + p.gFine * dFine
+            var yNew = bb4 + p.gCoarse * (bb2 - bb4) + p.gMid * dMid + p.gFine * dFine
+            // sin halos: el resultado no puede pasarse mucho del mínimo/máximo de sus vecinos
+            val mn = minOf(minOf(minOf(up[xm], up[x]), minOf(up[xp], mid[xm])), minOf(minOf(mid[xp], dn[xm]), minOf(minOf(dn[x], dn[xp]), yv)))
+            val mx = maxOf(maxOf(maxOf(up[xm], up[x]), maxOf(up[xp], mid[xm])), maxOf(maxOf(mid[xp], dn[xm]), maxOf(maxOf(dn[x], dn[xp]), yv)))
+            yNew = yNew.coerceIn(mn - 0.015f, mx + 0.015f)
             val delta = ((yNew - yv).coerceIn(-p.maxDelta, p.maxDelta) * 255f)
 
             val pix = px[base + x]
@@ -326,8 +330,8 @@ fun detailParamsFor(
     val fine = if (night) 0.4f else 0.7f
     return DetailParams(
         gFine = 1f + fine * s,
-        gMid = 1f + 0.45f * s,
-        gCoarse = 1f + 0.1f * s,
+        gMid = 1f + 0.25f * s,
+        gCoarse = 1f,
         tFine = 2.5f * sigmaOut * n,
         tMid = 1.0f * sigmaOut * n
     )

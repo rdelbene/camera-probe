@@ -149,8 +149,7 @@ private fun fmtT(ns: Long): String =
 private val GREEN = Color.rgb(0, 224, 150)
 /** Máximo que pone la cámara stock (1000 nits / 203 nits), medido en sus fotos. */
 private const val STOCK_UHDR_MAX = 4.93f
-/** Cuadros que se fusionan en el modo Foto. */
-private const val BURST = 5
+
 private val DARK = Color.argb(200, 40, 40, 40)
 
 class MainActivity : Activity(), SensorEventListener {
@@ -875,7 +874,7 @@ class MainActivity : Activity(), SensorEventListener {
         val what = when {
             videoMode -> "video ${videoSize.height}p $videoFps fps"
             nightMode -> "noche, $nightFrames fotos"
-            else -> "Foto: ráfaga de $BURST cuadros + Ultra HDR ${prof().hdr} %"
+            else -> "Foto: ráfaga de 5 a 9 cuadros + Ultra HDR ${prof().hdr} %"
         }
         return "${if (lens.front) "Frontal" else lens.label} · $where · $what"
     }
@@ -1444,10 +1443,10 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     /**
-     * Foto: el chip procesa cada cuadro (exposición, color, tono de Motorola) con su reducción de ruido al mínimo
-     * y sin nitidez propia; la app alinea y fusiona $BURST cuadros (como el modo NR de Open Camera / HDR+),
-     * limpia el ruido de color, aplica nitidez según el ruido que quedó y arma el Ultra HDR con una toma
-     * 3 pasos más oscura.
+     * Foto: el chip procesa cada cuadro (color y tono de Motorola) sin su reducción de ruido ni su nitidez;
+     * la ráfaga va 0.5 a 1 paso subexpuesta para proteger las luces (como HDR+). La app alinea y fusiona
+     * 5 a 9 cuadros, sube las sombras con un mapeo de tonos local, limpia el ruido de color, aplica nitidez
+     * sin halos según el ruido que quedó y arma el Ultra HDR con una toma 3 pasos más oscura.
      */
     private fun shootStock() {
         val s = session ?: return say("Cámara no lista")
@@ -1460,12 +1459,20 @@ class MainActivity : Activity(), SensorEventListener {
         try {
             val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val nrModes = mgr.getCameraCharacteristics(camId).get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: intArrayOf()
-            val nr = if (nrModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL)) CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL
-                else CameraMetadata.NOISE_REDUCTION_MODE_FAST
-            // misma exposición en todos los cuadros (lo que midió el visor), con tope para no mover la foto
-            val t = t0.coerceAtMost(66_666_667L)
-            val iso = ((t0.toDouble() * iso0) / t).roundToInt().coerceIn(isoMin, isoMax)
-            val shot = BurstShot(BURST, withUnder, boost, lens.name)
+            // como Open Camera: sin la reducción de ruido del chip (borra detalle); el ruido lo baja la fusión
+            val nr = when {
+                nrModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_OFF) -> CameraMetadata.NOISE_REDUCTION_MODE_OFF
+                nrModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL) -> CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL
+                else -> CameraMetadata.NOISE_REDUCTION_MODE_FAST
+            }
+            // como HDR+: la ráfaga va subexpuesta para no quemar las luces; después se compensa al revelar.
+            // Con poca luz se subexpone menos y se juntan más cuadros.
+            val ecStops = if (iso0 < 800) 1.0f else 0.5f
+            val frames = when { iso0 < 400 -> 5; iso0 < 1600 -> 7; else -> 9 }
+            val total = t0.toDouble() * iso0 / Math.pow(2.0, ecStops.toDouble())
+            val t = (total / isoMin).toLong().coerceAtMost(minOf(t0, 66_666_667L)).coerceIn(expMin, expMax)
+            val iso = (total / t).roundToInt().coerceIn(isoMin, isoMax)
+            val shot = BurstShot(frames, withUnder, boost, lens.name, ecStops)
             stockShot = shot
             fun req(tt: Long, ii: Int, tag: String) = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(target)).apply {
                 set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -1476,9 +1483,10 @@ class MainActivity : Activity(), SensorEventListener {
                 set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_OFF)
                 setTag(tag)
             }.build()
-            val reqs = MutableList(BURST) { req(t, iso, "n") }
+            val reqs = MutableList(frames) { req(t, iso, "n") }
             if (withUnder) {
-                val total = t.toDouble() * iso / 8.0
+                // toma para el Ultra HDR: 3 pasos por debajo de lo que midió el visor
+                val total = t0.toDouble() * iso0 / 8.0
                 val tu = (total / isoMin).toLong().coerceAtMost(t).coerceIn(expMin, expMax)
                 val iu = (total / tu).roundToInt().coerceIn(isoMin, isoMax)
                 reqs += req(tu, iu, "under")
@@ -1499,7 +1507,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
-    inner class BurstShot(val n: Int, val withUnder: Boolean, val boost: Float, val lensName: String) {
+    inner class BurstShot(val n: Int, val withUnder: Boolean, val boost: Float, val lensName: String, val ecStops: Float) {
         private val expected = n + if (withUnder) 1 else 0
         private val tagByTs = java.util.concurrent.ConcurrentHashMap<Long, String>()
         @Volatile private var got = 0
@@ -1554,19 +1562,22 @@ class MainActivity : Activity(), SensorEventListener {
                     say("Procesando ${m.frames} fotos...")
                     var waited = 0
                     while ((normalExposure == 0.0 || (under != null && underExposure == 0.0)) && waited < 1000) { Thread.sleep(20); waited += 20 }
-                    val merged = m.result()
-                    val w = merged.w; val h = merged.h
-                    val px = yuvToArgb(merged)
+                    val w = m.w; val h = m.h
+                    val (yF, uB, vB) = m.resultPlanes()
+                    // revelado: compensa la subexposición y sube las sombras localmente (sin halos)
+                    val (px, lift) = toneMapToArgb(yF, uB, vB, w, h, ecStops, 1.6f)
                     val eff = m.effectiveFrames().coerceAtLeast(1f)
-                    // ruido que queda (0..1) para calibrar la limpieza y la nitidez
-                    val sigmaOut = (m.noiseSigma / 255f / kotlin.math.sqrt(eff)).coerceIn(0f, 0.05f)
+                    // ruido que queda (0..1); en las sombras levantadas es mayor
+                    val sigmaOut = (m.noiseSigma / 255f / kotlin.math.sqrt(eff) * (1f + 0.5f * lift)).coerceIn(0f, 0.05f)
                     val stock = StockProfiles.forLens(lensName)
                     val dp = detailParamsFor(sigmaOut, false, 0, 0, stock.sharpMul, stock.nrMul)
                     detailEnhance(px, w, h, dp)
 
                     // Ultra HDR: toma oscura contra la fusionada
                     val u = under
-                    val ratio = if (u != null && underExposure > 0.0 && normalExposure > 0.0) (normalExposure / underExposure).toFloat() else 0f
+                    // la foto final equivale a la exposición de la ráfaga compensada (+ecStops)
+                    val ratio = if (u != null && underExposure > 0.0 && normalExposure > 0.0)
+                        (normalExposure / underExposure * Math.pow(2.0, ecStops.toDouble())).toFloat() else 0f
                     var gm: ByteArray? = null
                     var gw = 0; var gh = 0
                     if (u != null && ratio > 1f && u.w == w && u.h == h) {
@@ -1580,7 +1591,8 @@ class MainActivity : Activity(), SensorEventListener {
                     if (uri != null) { lastUri = uri; lastMime = "image/jpeg" }
                     setThumb(BitmapFactory.decodeByteArray(out, 0, out.size, BitmapFactory.Options().apply { inSampleSize = 16 }))
                     val secs = (System.currentTimeMillis() - started) / 1000.0
-                    lastShotInfo = "Última: FOTO · $info · ${m.frames} cuadros (efectivos %.1f) · desplaz. máx ${m.maxShift} px\n".format(eff) +
+                    lastShotInfo = "Última: FOTO · $info (−%.1f EV) · ${m.frames} cuadros (efectivos %.1f) · desplaz. máx ${m.maxShift} px\n".format(ecStops, eff) +
+                        "sombras +%.1f pasos · ".format(lift) +
                         "ruido por cuadro %.1f → %.1f · nitidez ×%.2f/×%.2f · ".format(m.noiseSigma, m.noiseSigma / kotlin.math.sqrt(eff), dp.gFine, dp.gMid) +
                         (if (gm != null) "Ultra HDR ×%.1f".format(boost) else if (withUnder) "sin luces que realzar" else "Ultra HDR apagado") +
                         " · %.1f s".format(secs)
