@@ -303,11 +303,15 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
     val lut = FloatArray(4096) { i -> srgbToLinF(i / 4095f) }
     // log2 de la luminancia lineal, con la compensación de la subexposición de la ráfaga (hombro suave en las luces)
     val ecGain = Math.pow(2.0, exposureComp.toDouble()).toFloat()
-    val l = FloatArray(n) { i ->
-        var lin = lut[(y[i] / 255f * 4095f).toInt().coerceIn(0, 4095)] * ecGain
+    // tabla: luma (0..255 en pasos de 1/64) -> log2 de la luminancia lineal compensada
+    val logLut = FloatArray(16385) { i ->
+        var lin = srgbToLinF(i / 16384f) * ecGain
         if (lin > 0.7f) lin = 0.7f + 0.3f * (1f - kotlin.math.exp(-(lin - 0.7f) / 0.3f))
         (Math.log((lin + 1e-4).toDouble()) / Math.log(2.0)).toFloat()
     }
+    val l = FloatArray(n) { i -> logLut[(y[i] * (16384f / 255f) + 0.5f).toInt().coerceIn(0, 16384)] }
+    // tabla de salida: log2 lineal (-14..1, pasos de 1/512) -> luma 0..255 en gamma sRGB
+    val outLut = FloatArray(15 * 512 + 1) { i -> linToSrgbF(Math.pow(2.0, -14.0 + i / 512.0).toFloat()) * 255f }
     // filtro guiado rápido: coeficientes a resolución 1/4
     val s = 4
     val ws = (w + s - 1) / s; val hs = (h + s - 1) / s
@@ -356,8 +360,7 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
             val raw = (newBase - base).coerceAtLeast(0f)
             val gain = maxLift * kotlin.math.tanh(raw / maxLift)
             if (base < lo + range * 0.4f) { liftAcc += gain; liftN++ }
-            val lin = Math.pow(2.0, (l[i] + gain).toDouble()).toFloat()
-            y[i] = (linToSrgbF(lin) * 255f).coerceIn(0f, 255f)
+            y[i] = outLut[(((l[i] + gain) + 14f) * 512f).toInt().coerceIn(0, outLut.size - 1)]
         }
     }
     return if (liftN > 0) (liftAcc / liftN).toFloat() else 0f
@@ -379,12 +382,13 @@ fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exp
     val lift = localToneMap(y, w, h, 1f, 3.2f, maxLift, exposureComp)
     val cw = (w + 1) / 2
     val out = IntArray(w * h)
+    val kLut = FloatArray(1025) { Math.pow(it / 256.0, 0.8).toFloat().coerceIn(0.5f, 4f) } // relación 0..4
     for (yy in 0 until h) {
         val crow = (yy shr 1) * cw
         for (xx in 0 until w) {
             val i = yy * w + xx
             val yn = y[i]
-            val k = if (old[i] > 1f) Math.pow((yn / old[i]).toDouble(), 0.8).toFloat().coerceIn(0.5f, 4f) else 1f
+            val k = if (old[i] > 1f) kLut[((yn / old[i]) * 256f).toInt().coerceIn(0, 1024)] else 1f
             val uu = ((u[crow + (xx shr 1)].toInt() and 255) - 128f) * k
             val vv = ((v[crow + (xx shr 1)].toInt() and 255) - 128f) * k
             val r = (yn + 1.402f * vv).toInt().coerceIn(0, 255)
@@ -395,3 +399,8 @@ fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exp
     }
     return out to lift
 }
+
+
+/** Planos para el revelado a partir de un cuadro (por ejemplo, el que devuelve el reproceso del chip). */
+fun YuvFrame.planes(): Triple<FloatArray, ByteArray, ByteArray> =
+    Triple(FloatArray(w * h) { (y[it].toInt() and 255).toFloat() }, u, v)

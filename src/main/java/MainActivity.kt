@@ -193,6 +193,10 @@ class MainActivity : Activity(), SensorEventListener {
     @Volatile private var stockShot: BurstShot? = null
     /** Qué ofrece el celu a apps de terceros (extensiones, Ultra HDR nativo, reproceso). */
     @Volatile private var capsNote = ""
+    /** Entrada para devolverle al chip la foto fusionada (reproceso YUV). */
+    @Volatile private var imageWriter: android.media.ImageWriter? = null
+    private var reprocSize: Size? = null
+    private val reprocBlocked = mutableSetOf<String>()
     private fun busy() = merger != null || stockShot != null
     private var physicalMode = false
     private var nightFrames = 15
@@ -1099,6 +1103,8 @@ class MainActivity : Activity(), SensorEventListener {
         reader = null
         try { rawReader?.close() } catch (_: Exception) {}
         rawReader = null
+        try { imageWriter?.close() } catch (_: Exception) {}
+        imageWriter = null
     }
 
     private fun pickSize(sizes: Array<Size>?, aspectW: Int, aspectH: Int, maxW: Int): Size? {
@@ -1119,6 +1125,9 @@ class MainActivity : Activity(), SensorEventListener {
             rawReader = null
             rawSupported = false
             rawInfo = null
+            try { imageWriter?.close() } catch (_: Exception) {}
+            imageWriter = null
+            reprocSize = null
             try { recSurface?.release() } catch (_: Exception) {}
             recSurface = null
             sessionNote = ""
@@ -1183,6 +1192,16 @@ class MainActivity : Activity(), SensorEventListener {
                     val ys = pickSize(map.getOutputSizes(ImageFormat.YUV_420_888), 4, 3, 4096)!!
                     val r = ImageReader.newInstance(ys.width, ys.height, ImageFormat.YUV_420_888, 3)
                     r.setOnImageAvailableListener({ rd -> onYuv(rd) }, camHandler)
+                    // ¿se le puede devolver al chip la foto fusionada? (reproceso YUV -> YUV del mismo tamaño)
+                    val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+                    reprocSize = try {
+                        if (caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_YUV_REPROCESSING) &&
+                            sessKey !in reprocBlocked &&
+                            map.inputFormats.contains(ImageFormat.YUV_420_888) &&
+                            map.getInputSizes(ImageFormat.YUV_420_888)?.contains(ys) == true &&
+                            map.getValidOutputFormatsForInput(ImageFormat.YUV_420_888).contains(ImageFormat.YUV_420_888)
+                        ) ys else null
+                    } catch (_: Exception) { null }
                     reader = r
                     surfaces += r.surface
                 } else {
@@ -1204,9 +1223,17 @@ class MainActivity : Activity(), SensorEventListener {
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
                         session = s
+                        if (s.isReprocessable) s.inputSurface?.let {
+                            try { imageWriter = android.media.ImageWriter.newInstance(it, 2) } catch (_: Exception) {}
+                        }
                         updatePreview()
                     }
                     override fun onConfigureFailed(s: CameraCaptureSession) {
+                        if (reprocSize != null) {
+                            reprocBlocked += sessKey
+                            camHandler.post { startSession() }
+                            return
+                        }
                         if (rawReader != null) {
                             rawBlocked += sessKey
                             say("Este lente no acepta RAW junto al visor: sigo con JPEG")
@@ -1217,6 +1244,7 @@ class MainActivity : Activity(), SensorEventListener {
                     }
                 }
             )
+            reprocSize?.let { cfg.inputConfiguration = android.hardware.camera2.params.InputConfiguration(it.width, it.height, ImageFormat.YUV_420_888) }
             val sp = d.createCaptureRequest(repeatingTemplate())
             if (videoMode) sp.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
             cfg.setSessionParameters(sp.build())
@@ -1416,7 +1444,24 @@ class MainActivity : Activity(), SensorEventListener {
         val ts = img.timestamp
         val frame = try { toYuvFrame(img) } catch (_: Exception) { null } finally { img.close() }
         val st = stockShot
-        if (st != null && frame != null) st.offer(frame, ts)
+        if (st != null && frame != null) {
+            if (st.awaitingReprocess) st.onReprocessed(frame) else st.offer(frame, ts)
+        }
+    }
+
+    /** Escribe un cuadro YUV planar en una imagen de la cámara (respetando sus pasos de fila y pixel). */
+    private fun fillYuvImage(img: Image, f: YuvFrame) {
+        val yp = img.planes[0]; val yb = yp.buffer
+        for (r in 0 until f.h) { yb.position(r * yp.rowStride); yb.put(f.y, r * f.w, f.w) }
+        val cw = f.cw; val ch = f.ch
+        for ((pi, src) in listOf(1 to f.u, 2 to f.v)) {
+            val p = img.planes[pi]; val b = p.buffer; val ps = p.pixelStride; val rs = p.rowStride
+            val lim = b.limit()
+            for (r in 0 until ch) {
+                val base = r * rs
+                for (c in 0 until cw) { val k = base + c * ps; if (k < lim) b.put(k, src[r * cw + c]) }
+            }
+        }
     }
 
     /** Copia un Image YUV_420_888 (con los pasos de fila y pixel que use el chip) a planos compactos. */
@@ -1517,6 +1562,16 @@ class MainActivity : Activity(), SensorEventListener {
         @Volatile private var done = false
         private var merger: YuvMerger? = null
         @Volatile private var under: YuvFrame? = null
+        @Volatile private var refResult: TotalCaptureResult? = null
+        @Volatile var awaitingReprocess = false
+        @Volatile private var reprocFrame: YuvFrame? = null
+        private val reprocLatch = java.util.concurrent.CountDownLatch(1)
+
+        fun onReprocessed(f: YuvFrame) {
+            reprocFrame = f
+            awaitingReprocess = false
+            reprocLatch.countDown()
+        }
         private val started = System.currentTimeMillis()
 
         fun offer(f: YuvFrame, ts: Long) {
@@ -1543,7 +1598,7 @@ class MainActivity : Activity(), SensorEventListener {
             val iso = r.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
             val boostRaw = (r.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100) / 100.0
             val e = t.toDouble() * iso * boostRaw
-            if (tag == "under") underExposure = e else if (normalExposure == 0.0) { normalExposure = e; info = "${fmtT(t)} · ISO $iso" }
+            if (tag == "under") underExposure = e else if (normalExposure == 0.0) { normalExposure = e; refResult = r; info = "${fmtT(t)} · ISO $iso" }
         }
 
         fun onFailed() {
@@ -1563,14 +1618,45 @@ class MainActivity : Activity(), SensorEventListener {
                     var waited = 0
                     while ((normalExposure == 0.0 || (under != null && underExposure == 0.0)) && waited < 1000) { Thread.sleep(20); waited += 20 }
                     val w = m.w; val h = m.h
-                    val (yF, uB, vB) = m.resultPlanes()
+                    val eff = m.effectiveFrames().coerceAtLeast(1f)
+                    // Reproceso: la foto fusionada vuelve al chip, que aplica la reducción de ruido y la nitidez
+                    // de Motorola sabiendo que ahora tiene ~eff veces menos ruido.
+                    var reprocNote = "sin reproceso"
+                    var planes: Triple<FloatArray, ByteArray, ByteArray>? = null
+                    val wr = imageWriter; val ref = refResult; val sess = session; val tgt = reader?.surface; val dev = device
+                    if (wr != null && ref != null && sess != null && tgt != null && dev != null && sess.isReprocessable) {
+                        try {
+                            val merged = m.result(false)
+                            val img = wr.dequeueInputImage()
+                            fillYuvImage(img, merged)
+                            img.timestamp = ref.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L
+                            awaitingReprocess = true
+                            wr.queueInputImage(img)
+                            val rb = dev.createReprocessCaptureRequest(ref)
+                            rb.addTarget(tgt)
+                            rb.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                            rb.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_HIGH_QUALITY)
+                            rb.set(CaptureRequest.REPROCESS_EFFECTIVE_EXPOSURE_FACTOR, eff)
+                            sess.capture(rb.build(), null, camHandler)
+                            if (reprocLatch.await(6, java.util.concurrent.TimeUnit.SECONDS)) {
+                                reprocFrame?.let { planes = it.planes(); reprocNote = "reproceso del chip ✓" }
+                            } else reprocNote = "reproceso sin respuesta"
+                        } catch (e: Exception) {
+                            reprocNote = "reproceso falló: ${e.javaClass.simpleName}"
+                        } finally {
+                            awaitingReprocess = false
+                        }
+                    }
+                    val reprocessed = planes != null
+                    val (yF, uB, vB) = planes ?: m.resultPlanes()
                     // revelado: compensa la subexposición y sube las sombras localmente (sin halos)
                     val (px, lift) = toneMapToArgb(yF, uB, vB, w, h, ecStops, 1.6f)
-                    val eff = m.effectiveFrames().coerceAtLeast(1f)
                     // ruido que queda (0..1); en las sombras levantadas es mayor
                     val sigmaOut = (m.noiseSigma / 255f / kotlin.math.sqrt(eff) * (1f + 0.5f * lift)).coerceIn(0f, 0.05f)
                     val stock = StockProfiles.forLens(lensName)
-                    val dp = detailParamsFor(sigmaOut, false, 0, 0, stock.sharpMul, stock.nrMul)
+                    // si el chip ya hizo la reducción de ruido y la nitidez, solo un toque para compensar la suba de sombras
+                    val dp = if (reprocessed) DetailParams(1.1f, 1.05f, 1f, sigmaOut * 1.5f, 0f)
+                        else detailParamsFor(sigmaOut, false, 0, 0, stock.sharpMul, stock.nrMul)
                     detailEnhance(px, w, h, dp)
 
                     // Ultra HDR: toma oscura contra la fusionada
@@ -1592,7 +1678,7 @@ class MainActivity : Activity(), SensorEventListener {
                     setThumb(BitmapFactory.decodeByteArray(out, 0, out.size, BitmapFactory.Options().apply { inSampleSize = 16 }))
                     val secs = (System.currentTimeMillis() - started) / 1000.0
                     lastShotInfo = "Última: FOTO · $info (−%.1f EV) · ${m.frames} cuadros (efectivos %.1f) · desplaz. máx ${m.maxShift} px\n".format(ecStops, eff) +
-                        "sombras +%.1f pasos · ".format(lift) +
+                        "$reprocNote · sombras +%.1f pasos · ".format(lift) +
                         "ruido por cuadro %.1f → %.1f · nitidez ×%.2f/×%.2f · ".format(m.noiseSigma, m.noiseSigma / kotlin.math.sqrt(eff), dp.gFine, dp.gMid) +
                         (if (gm != null) "Ultra HDR ×%.1f".format(boost) else if (withUnder) "sin luces que realzar" else "Ultra HDR apagado") +
                         " · %.1f s".format(secs)
