@@ -3,6 +3,8 @@
 
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
@@ -16,6 +18,24 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <!-- "Nivel HDR": ajusta el Ultra HDR de fotos ya sacadas (ícono propio y "Compartir" desde la galería) -->
+        <activity
+            android:name=".HdrTunerActivity"
+            android:exported="true"
+            android:label="Nivel HDR"
+            android:screenOrientation="portrait"
+            android:taskAffinity="com.example.uhdrcam.tuner">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter android:label="Ajustar nivel HDR">
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/jpeg" />
             </intent-filter>
         </activity>
     </application>

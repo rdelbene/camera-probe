@@ -695,6 +695,13 @@ class MainActivity : Activity(), SensorEventListener {
         col.addView(hdrBar)
 
         col.addView(sheetLabel("Generales").apply { typeface = Typeface.DEFAULT_BOLD; setTextColor(GREEN) })
+        col.addView(TextView(this).apply {
+            text = "Ajustar nivel Ultra HDR de fotos de la cámara stock  ›"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setOnClickListener { startActivity(Intent(this@MainActivity, HdrTunerActivity::class.java)) }
+        })
         col.addView(Switch(this).apply {
             text = "Estilo Motorola: curva y color de la cámara stock (RAW)"
             setTextColor(Color.WHITE)
