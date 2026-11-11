@@ -299,7 +299,7 @@ private fun linToSrgbF(l: Float): Float { val x = l.coerceIn(0f, 1f); return if 
  * Devuelve la suba media de las sombras (en pasos) para saber cuánto se amplificó el ruido.
  *  rangeTarget: pasos que ocupan las sombras (del percentil 2 a la mediana) después de comprimir.
  */
-fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarget: Float = 4.5f, maxLift: Float = 1.0f, exposureComp: Float = 0f, noiseSigma: Float = 0f, midBoost: Float = 0.2f): Float {
+fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarget: Float = 4.5f, maxLift: Float = 1.0f, exposureComp: Float = 0f, noiseSigma: Float = 0f, midBoost: Float = 0.3f, refMedianLuma: Float = 0f): Float {
     if (strength <= 0f) return 0f
     val n = w * h
     val ecGain = Math.pow(2.0, exposureComp.toDouble()).toFloat()
@@ -341,9 +341,18 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
     val sorted = baseSmall.copyOf(); sorted.sort()
     fun pct(p: Double) = sorted[(sorted.size * p).toInt().coerceIn(0, sorted.size - 1)]
     val hi = pct(0.995); val lo = pct(0.02); val med = pct(0.5)
-    val medOut = (med + midBoost * strength).coerceAtMost(-1.8f) // la mediana no pasa de ~gris claro
-    val hiOut = -0.25f // luces de la base a ~0.84 lineal (~235): el detalle encima entra en el hombro
-    val cHi = if (hi > med + 0.1f) (1f - strength * (1f - ((hiOut - medOut) / (hi - med)).coerceIn(0.35f, 1f))) else 1f
+    // exposición: la mediana vuelve al brillo que tenía en el visor (medido ahí, así no depende de la curva del chip)
+    // + midBoost; sin medición, se deshace la subexposición
+    val medOut = if (refMedianLuma > 0.5f)
+        (Math.log(srgbToLinF((refMedianLuma / 255f).coerceIn(0.002f, 0.9f)).toDouble()) / Math.log(2.0)).toFloat() + midBoost * strength
+        else med + midBoost * strength
+    val shift = (medOut.coerceAtMost(-1.6f) - med).coerceIn(-1f, 4f)
+    // luces: hombro arriba de K; solo se comprime lo que no entra (ventanas, cielo), los medios quedan como están
+    val knee = -1.3f // ~0.4 lineal (~170)
+    val hiOut = -0.25f // la iluminación más alta queda en ~0.84 lineal; el detalle encima entra en el hombro de salida
+    val hiS = hi + shift
+    val cHi = if (hiS > hiOut && hiS > knee + 0.1f) (1f - strength * (1f - ((hiOut - knee) / (hiS - knee)).coerceIn(0.3f, 1f))) else 1f
+    // sombras: suba extra suave (las zonas oscuras se acercan un poco a la mediana)
     val cLo = if (med - lo > 0.1f) (1f - strength * (1f - (rangeTarget / (med - lo)).coerceIn(0.6f, 1f))) else 1f
     // aplicar a resolución completa (a y b interpolados); se guarda la suba de cada pixel (pasos × 64)
     val gainQ = if (noiseSigma > 0f) ByteArray(n) else null
@@ -361,11 +370,12 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
             }
             val i = yy * w + xx
             val base = bil(ma) * l[i] + bil(mb)
-            val newBase = if (base >= med) medOut + (base - med) * cHi else medOut + (base - med) * cLo
-            var gain = newBase - base
-            // la suba tiene tope suave (las zonas muy oscuras siguen oscuras); la bajada de las luces no
-            if (gain > 0f) gain = maxLift * kotlin.math.tanh(gain / maxLift)
-            if (base < lo + (med - lo) * 0.5f) { liftAcc += gain; liftN++ }
+            var nb = base + shift
+            if (nb > knee) nb = knee + (nb - knee) * cHi
+            var extra = if (base < med) (med - base) * (1f - cLo) else 0f
+            extra = maxLift * kotlin.math.tanh(extra / maxLift) // tope suave: lo muy oscuro sigue oscuro
+            val gain = nb - base + extra
+            if (base < lo + (med - lo) * 0.5f) { liftAcc += extra; liftN++ }
             if (gainQ != null) gainQ[i] = (gain * 64f).toInt().coerceIn(0, 127).toByte()
             y[i] = outLut[(((l[i] + gain) + 14f) * 512f).toInt().coerceIn(0, outLut.size - 1)]
         }
@@ -408,9 +418,9 @@ fun YuvMerger.resultPlanes(): Triple<FloatArray, ByteArray, ByteArray> {
  * Mapeo de tonos local + conversión a ARGB. El croma se escala con la luma para que el color no se apague
  * en las sombras levantadas. Devuelve los pixeles y cuánto se subieron las sombras (pasos).
  */
-fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exposureComp: Float, maxLift: Float, noiseSigma: Float = 0f): Pair<IntArray, Float> {
+fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exposureComp: Float, maxLift: Float, noiseSigma: Float = 0f, refMedianLuma: Float = 0f): Pair<IntArray, Float> {
     val old = y.copyOf()
-    val lift = localToneMap(y, w, h, 1f, 4.5f, maxLift, exposureComp, noiseSigma)
+    val lift = localToneMap(y, w, h, 1f, 4.5f, maxLift, exposureComp, noiseSigma, 0.3f, refMedianLuma)
     val cw = (w + 1) / 2
     val out = IntArray(w * h)
     val kLut = FloatArray(1025) { Math.pow(it / 256.0, 0.7).toFloat().coerceIn(0.5f, 4f) } // relación 0..4
