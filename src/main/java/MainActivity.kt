@@ -2116,10 +2116,10 @@ class MainActivity : Activity(), SensorEventListener {
                 detailEnhance(px, w, h, dParams)
                 detailNote = "realce JPEG ×%.2f/×%.2f".format(dParams.gFine, dParams.gMid)
             }
-            val sg = if (makeGain && k > 0f) stockCurveGainMap(px, w, h) else null
+            val gmap = if (makeGain && k > 0f) stockCurveGainMap(px, w, h) else null
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             bmp.setPixels(px, 0, w, 0, 0, w, h)
-            return encode(bmp, sg?.first, sg?.second ?: 0, sg?.third ?: 0, STOCK_UHDR_MAX.pow(k))
+            return encode(bmp, gmap?.first, gmap?.second ?: 0, gmap?.third ?: 0, STOCK_UHDR_MAX.pow(k))
         }
 
         /** Revelado del RAW fusionado: negro/blanco, sombreado del lente, balance, demosaico, matriz de color y tono. */
@@ -2218,10 +2218,10 @@ class MainActivity : Activity(), SensorEventListener {
                 (if (lsm == null) " · sombreado estimado" else "") + (if (ccmT == null) " · color de la stock" else ""))
 
             // Ultra HDR con la curva de la stock (igual que en Foto)
-            val sg = if (makeGain && k > 0f) stockCurveGainMap(px, w, h) else null
+            val gmap = if (makeGain && k > 0f) stockCurveGainMap(px, w, h) else null
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             bmp.setPixels(px, 0, w, 0, 0, w, h)
-            return encode(bmp, sg?.first, sg?.second ?: 0, sg?.third ?: 0, STOCK_UHDR_MAX.pow(k))
+            return encode(bmp, gmap?.first, gmap?.second ?: 0, gmap?.third ?: 0, STOCK_UHDR_MAX.pow(k))
         }
 
         /** Gira, adjunta el gain map (si hay) y comprime. */
