@@ -110,7 +110,7 @@ class MainActivity : Activity() {
     private var lens = Lens.MAIN
     private var videoMode = false
     private var physicalMode = false
-    /** Procesamiento HDR: 0 desactivado (1 foto), 1 activo (fusión de 8), 2 mejorado (fusión de 15). */
+    /** Procesamiento HDR: 1 activo (fusión de 8), 2 mejorado (fusión de 15). */
     private var hdrMode = 1
     /** Formato de archivo Ultra HDR (JPEG con gain map). Independiente del procesamiento. */
     private var ultraHdr = true
@@ -142,7 +142,6 @@ class MainActivity : Activity() {
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
     private var previewSurface: Surface? = null
-    private var stillIsUltra = false
     private var sensorOrientation = 90
 
     private var expMin = 1_000L
@@ -178,8 +177,6 @@ class MainActivity : Activity() {
 
     // Captura en curso
     private var pendingLens = Lens.MAIN
-    private var pendingHdr = 100
-    private var pendingUltra = false
     @Volatile private var merger: Merger? = null
 
     // ------------------------------------------------------------------ ciclo de vida
@@ -195,7 +192,7 @@ class MainActivity : Activity() {
                 prefs.getInt("${l.name}_hdr2", 100)
             )
         }
-        hdrMode = prefs.getInt("hdrMode", 1).coerceIn(0, 2)
+        hdrMode = prefs.getInt("hdrMode", 1).coerceIn(1, 2)
         ultraHdr = prefs.getBoolean("ultraHdr", true)
         nightFrames = prefs.getInt("nightFrames", 15).let { if (it in listOf(10, 15, 20)) it else 15 }
         hlSteps = prefs.getInt("hlSteps", 3).coerceIn(0, 9)
@@ -353,16 +350,16 @@ class MainActivity : Activity() {
         // ---------------- foto
         photoBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         photoBox.addView(label("HDR (procesamiento)"))
-        photoBox.addView(radioRow(listOf("Desactivado", "Activo", "Mejorado"), hdrMode) {
-            hdrMode = it; save(); afterPhotoModeChange()
+        photoBox.addView(radioRow(listOf("Activo (8 fotos)", "Mejorado (15 fotos)"), hdrMode - 1) {
+            hdrMode = it + 1; save(); updateShutter(); updatePreview()
         })
         photoBox.addView(switchRow("Ultra HDR (archivo con gain map para pantallas HDR)", ultraHdr) {
-            ultraHdr = it; save(); afterPhotoModeChange()
+            ultraHdr = it; save(); updateShutter()
         })
         photoBox.addView(switchRow("Modo noche", nightMode) {
             nightMode = it
             nightBox.visibility = if (it) View.VISIBLE else View.GONE
-            afterPhotoModeChange()
+            updateShutter(); updatePreview()
         })
         nightBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -457,7 +454,7 @@ class MainActivity : Activity() {
     private fun hlText(): String {
         val ev = hlSteps / 3f
         return "Protección de luces altas: %.1f EV".format(ev) +
-            if (hlSteps == 0) "  (sin margen: no se genera Ultra HDR en Activo/Mejorado/Noche)" else ""
+            if (hlSteps == 0) "  (sin margen: no se genera Ultra HDR)" else ""
     }
 
     private fun refreshControls() {
@@ -477,14 +474,9 @@ class MainActivity : Activity() {
             videoMode && recording -> "■  DETENER"
             videoMode -> "●  GRABAR  (${if (v4k) "4K" else "FHD"} ${if (v60) 60 else 30} fps)"
             nightMode -> "FOTO  (noche, $nightFrames fotos" + (if (ultraHdr) " + Ultra HDR)" else ")")
-            else -> "FOTO  (HDR " + arrayOf("desactivado", "activo", "mejorado")[hdrMode] +
+            else -> "FOTO  (HDR " + (if (hdrMode == 2) "mejorado" else "activo") +
                 (if (ultraHdr) " + Ultra HDR)" else ")")
         }
-    }
-
-    private fun afterPhotoModeChange() {
-        updateShutter()
-        if (device != null) startSession()
     }
 
     private fun restartVideo() {
@@ -530,7 +522,7 @@ class MainActivity : Activity() {
             videoMode && recording -> "● GRABANDO ${videoSize.height}p $videoFps fps"
             videoMode -> "video ${videoSize.height}p $videoFps fps"
             nightMode -> "noche $nightFrames fotos"
-            else -> "HDR " + arrayOf("desactivado", "activo", "mejorado")[hdrMode]
+            else -> "HDR " + if (hdrMode == 2) "mejorado" else "activo"
         }
         return "${lens.label} · $where · $what$sessionNote$vendorLog"
     }
@@ -730,20 +722,12 @@ class MainActivity : Activity() {
                 surfaces += ps
                 surfaces += rs
             } else {
-                var fmt = if (singleUltraWanted()) ImageFormat.JPEG_R else ImageFormat.JPEG
-                var stillSize = pickSize(map.getOutputSizes(fmt), 4, 3, 4096)
-                if (stillSize == null && fmt == ImageFormat.JPEG_R) {
-                    fmt = ImageFormat.JPEG
-                    stillSize = pickSize(map.getOutputSizes(fmt), 4, 3, 4096)
-                    sessionNote += "\nEste lente no entrega Ultra HDR propio: guardo JPEG común"
-                }
-                stillIsUltra = fmt == ImageFormat.JPEG_R
-                val ss = stillSize!!
+                val ss = pickSize(map.getOutputSizes(ImageFormat.JPEG), 4, 3, 4096)!!
                 val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), 4, 3, 1440)!!
                 st.setDefaultBufferSize(prev.width, prev.height)
                 val ps = Surface(st)
                 previewSurface = ps
-                val r = ImageReader.newInstance(ss.width, ss.height, fmt, 8)
+                val r = ImageReader.newInstance(ss.width, ss.height, ImageFormat.JPEG, 8)
                 r.setOnImageAvailableListener({ rd -> onStill(rd) }, camHandler)
                 reader = r
                 surfaces += ps
@@ -774,9 +758,6 @@ class MainActivity : Activity() {
             say("Sesión: ${e.javaClass.simpleName} ${e.message}")
         }
     }
-
-    /** Una sola foto con el Ultra HDR del fabricante: solo cuando no hay fusión. */
-    private fun singleUltraWanted() = ultraHdr && hdrMode == 0 && !nightMode
 
     private fun buildRequest(template: Int, targets: List<Surface>): CaptureRequest.Builder {
         val b = device!!.createCaptureRequest(template)
@@ -871,9 +852,8 @@ class MainActivity : Activity() {
         if (merger != null) { say("Todavía estoy procesando la foto anterior..."); return }
         when {
             nightMode -> startMerge(nightFrames, true)
-            hdrMode == 1 -> startMerge(8, false)
             hdrMode == 2 -> startMerge(15, false)
-            else -> takeSingle()
+            else -> startMerge(8, false)
         }
     }
 
@@ -886,76 +866,10 @@ class MainActivity : Activity() {
             img.close()
         }
         val m = merger
-        if (m != null && m.accepting()) m.offer(bytes) else onSinglePhoto(bytes)
-    }
-
-    // ------------------------------------------------------------------ foto simple
-
-    private fun takeSingle() {
-        val s = session ?: return say("Cámara no lista")
-        val r = reader ?: return say("Cámara no lista")
-        try {
-            pendingLens = lens
-            pendingHdr = prof().hdr
-            pendingUltra = stillIsUltra
-            val b = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(r.surface))
-            b.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
-            b.set(CaptureRequest.JPEG_QUALITY, 97.toByte())
-            s.capture(b.build(), null, camHandler)
-            say("Capturando...")
-        } catch (e: Exception) {
-            say("Captura: ${e.javaClass.simpleName} ${e.message}")
-        }
-    }
-
-    private fun onSinglePhoto(bytes: ByteArray) {
-        val base = "IMG_${stamp()}_${pendingLens.name}"
-        if (!pendingUltra) {
-            saveImage(bytes, "$base.jpg")
-            say("Guardada: $base.jpg (una foto, sin HDR)")
-            return
-        }
-        val hdr = pendingHdr
-        if (hdr == 100) {
-            saveImage(bytes, "${base}_UHDR.jpg")
-            say("Guardada: ${base}_UHDR.jpg (Ultra HDR del fabricante)")
-            return
-        }
-        val adjusted = try { adjustGainmap(bytes, hdr / 100f) } catch (e: Throwable) { null }
-        if (adjusted != null) {
-            saveImage(adjusted, "${base}_UHDR$hdr.jpg")
-            say("Guardada con Ultra HDR al $hdr%")
-        } else {
-            saveImage(bytes, "${base}_UHDR.jpg")
-            say("Guardada la original. El ajuste del gain map falló en este equipo.")
-        }
+        if (m != null && m.accepting()) m.offer(bytes)
     }
 
     private fun stamp() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-
-    /** Escala el efecto del gain map del fabricante (k=0 sin HDR, 1 igual, >1 más fuerte). */
-    private fun adjustGainmap(src: ByteArray, k: Float): ByteArray? {
-        val bmp = BitmapFactory.decodeByteArray(src, 0, src.size) ?: return null
-        val gm = bmp.gainmap ?: return null
-        val mx = gm.ratioMax
-        val mn = gm.ratioMin
-        gm.setRatioMax(mx[0].pow(k), mx[1].pow(k), mx[2].pow(k))
-        gm.setRatioMin(mn[0].pow(k), mn[1].pow(k), mn[2].pow(k))
-        bmp.setGainmap(gm)
-
-        val needsRotation = sensorOrientation % 180 != 0 && bmp.width > bmp.height
-        val out = if (needsRotation) {
-            val m = Matrix().apply { postRotate(sensorOrientation.toFloat()) }
-            Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
-        } else bmp
-        if (!out.hasGainmap()) return null
-
-        val bos = ByteArrayOutputStream()
-        out.compress(Bitmap.CompressFormat.JPEG, 96, bos)
-        val result = bos.toByteArray()
-        val check = BitmapFactory.decodeByteArray(result, 0, result.size)
-        return if (check != null && check.hasGainmap()) result else null
-    }
 
     // ------------------------------------------------------------------ fusión (HDR activo / mejorado / noche)
 
