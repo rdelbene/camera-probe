@@ -1510,22 +1510,20 @@ class MainActivity : Activity(), SensorEventListener {
                 nrModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL) -> CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL
                 else -> CameraMetadata.NOISE_REDUCTION_MODE_FAST
             }
-            // como HDR+: la ráfaga va subexpuesta para no quemar las luces; después se compensa al revelar.
-            // Con poca luz se subexpone menos y se juntan más cuadros.
-            // medición de luces en el visor: cuanto más quemado está, más se subexpone (hasta 3 pasos con buena luz)
+            // medición del visor. Los cuadros YUV son de 8 bits: subexponer mucho y después levantar deja bandas
+            // y color lavado. Por eso la ráfaga va casi a la exposición del visor y, si hay luces quemadas,
+            // se agregan 2 tomas oscuras solo para recuperarlas (horquillado).
             val (clip, vfMed) = meterHighlights()
-            val ecMax = when { iso0 < 200 -> 3f; iso0 < 400 -> 2.5f; iso0 < 800 -> 2f; iso0 < 1600 -> 1.5f; else -> 1f }
-            val ecBase = if (iso0 < 800) 1.0f else 0.5f
-            val ecStops = if (clip > 0.003f)
-                (ecBase + 0.6f * (Math.log((clip / 0.003f).toDouble()) / Math.log(2.0)).toFloat()).coerceIn(ecBase, ecMax)
-                else ecBase
+            val ecStops = if (iso0 < 800) 0.3f else 0f
             highlightClip = clip
             viewMedian = vfMed
-            val frames = when { iso0 < 400 -> 5; iso0 < 1600 -> 7; else -> 9 } + (if (ecStops >= 2f) 2 else 0)
+            val nUnder = if (clip > 0.005f && iso0 < 1600) 2 else 0
+            val underEv = (1.5f + 0.6f * (Math.log((clip / 0.005f).toDouble()) / Math.log(2.0)).toFloat()).coerceIn(1.5f, 3.5f)
+            val frames = when { iso0 < 400 -> 5; iso0 < 1600 -> 7; else -> 9 }
             val total = t0.toDouble() * iso0 / Math.pow(2.0, ecStops.toDouble())
             val t = (total / isoMin).toLong().coerceAtMost(minOf(t0, 66_666_667L)).coerceIn(expMin, expMax)
             val iso = (total / t).roundToInt().coerceIn(isoMin, isoMax)
-            val shot = BurstShot(frames, withUnder, boost, lens.name, ecStops)
+            val shot = BurstShot(frames, nUnder, if (nUnder > 0) underEv else 0f, withUnder, boost, lens.name, ecStops)
             stockShot = shot
             fun req(tt: Long, ii: Int, tag: String) = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(target)).apply {
                 set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -1537,12 +1535,11 @@ class MainActivity : Activity(), SensorEventListener {
                 setTag(tag)
             }.build()
             val reqs = MutableList(frames) { req(t, iso, "n") }
-            if (false) {
-                // (ya no se usa: el Ultra HDR sigue la curva de la stock) toma 3 pasos por debajo del visor
-                val total = t0.toDouble() * iso0 / 8.0
-                val tu = (total / isoMin).toLong().coerceAtMost(t).coerceIn(expMin, expMax)
-                val iu = (total / tu).roundToInt().coerceIn(isoMin, isoMax)
-                reqs += req(tu, iu, "under")
+            if (nUnder > 0) {
+                val tot = t0.toDouble() * iso0 / Math.pow(2.0, underEv.toDouble())
+                val tu = (tot / isoMin).toLong().coerceAtMost(t).coerceIn(expMin, expMax)
+                val iu = (tot / tu).roundToInt().coerceIn(isoMin, isoMax)
+                repeat(nUnder) { reqs += req(tu, iu, "under") }
             }
             s.captureBurst(reqs, object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(ses: CameraCaptureSession, req: CaptureRequest, res: TotalCaptureResult) {
@@ -1585,8 +1582,8 @@ class MainActivity : Activity(), SensorEventListener {
         return c.toFloat() / px.size to med.toFloat()
     }
 
-    inner class BurstShot(val n: Int, val withUnder: Boolean, val boost: Float, val lensName: String, val ecStops: Float) {
-        private val expected = n
+    inner class BurstShot(val n: Int, val nUnder: Int, val underEv: Float, val withUnder: Boolean, val boost: Float, val lensName: String, val ecStops: Float) {
+        private val expected = n + nUnder
         private val tagByTs = java.util.concurrent.ConcurrentHashMap<Long, String>()
         @Volatile private var got = 0
         private val vfMedian = viewMedian
@@ -1596,7 +1593,7 @@ class MainActivity : Activity(), SensorEventListener {
         @Volatile private var info = ""
         @Volatile private var done = false
         private var merger: YuvMerger? = null
-        @Volatile private var under: YuvFrame? = null
+        private val unders = java.util.Collections.synchronizedList(mutableListOf<YuvFrame>())
         @Volatile private var refResult: TotalCaptureResult? = null
         @Volatile var awaitingReprocess = false
         @Volatile private var reprocFrame: YuvFrame? = null
@@ -1613,8 +1610,9 @@ class MainActivity : Activity(), SensorEventListener {
             if (done) return
             val idx = got++
             val tag = tagByTs[ts]
-            if (tag == "under") {
-                under = f
+            // las tomas oscuras van al final de la ráfaga
+            if (tag == "under" || idx >= n) {
+                unders += f
             } else {
                 mergeExec.execute {
                     try {
@@ -1651,7 +1649,7 @@ class MainActivity : Activity(), SensorEventListener {
                     val m = merger ?: run { say("No llegaron las fotos"); return@execute }
                     say("Procesando ${m.frames} fotos...")
                     var waited = 0
-                    while ((normalExposure == 0.0 || (under != null && underExposure == 0.0)) && waited < 1000) { Thread.sleep(20); waited += 20 }
+                    while (normalExposure == 0.0 && waited < 1000) { Thread.sleep(20); waited += 20 }
                     val w = m.w; val h = m.h
                     val eff = m.effectiveFrames().coerceAtLeast(1f)
                     // Reproceso: la foto fusionada vuelve al chip, que aplica la reducción de ruido y la nitidez
@@ -1692,6 +1690,16 @@ class MainActivity : Activity(), SensorEventListener {
                     }
                     val reprocessed = planes != null
                     val (yF, uB, vB) = planes ?: m.resultPlanes()
+                    // HDR por horquillado: luces de las tomas oscuras (alineadas a la referencia y promediadas)
+                    var hlNote = ""
+                    if (unders.isNotEmpty()) {
+                        try {
+                            val warped = unders.toList().map { m.warpToRef(it) }
+                            val uf = if (warped.size == 1) warped[0] else blendYuv(warped[0], warped[1], 0.5f)
+                            val pct = fuseHighlights(yF, uB, vB, w, h, uf)
+                            hlNote = if (pct > 0f) "luces de la toma −%.1f EV en %.1f %% · ".format(underEv, pct) else "toma oscura sin usar · "
+                        } catch (e: Throwable) { hlNote = "toma oscura falló · " }
+                    }
                     // revelado: compensa la subexposición y sube las sombras localmente (sin halos)
                     val sigmaLevels = (m.noiseSigma / kotlin.math.sqrt(eff)).coerceAtLeast(0.8f)
                     val (px, lift) = toneMapToArgb(yF, uB, vB, w, h, ecStops, 1.0f, sigmaLevels, vfMedian)
@@ -1715,8 +1723,8 @@ class MainActivity : Activity(), SensorEventListener {
                     if (uri != null) { lastUri = uri; lastMime = "image/jpeg" }
                     setThumb(BitmapFactory.decodeByteArray(out, 0, out.size, BitmapFactory.Options().apply { inSampleSize = 16 }))
                     val secs = (System.currentTimeMillis() - started) / 1000.0
-                    lastShotInfo = "Última: FOTO · $info (−%.1f EV; visor quemado %.1f %%, mediana %.0f) · ${m.frames} cuadros (efectivos %.1f) · desplaz. máx ${m.maxShift} px\n".format(ecStops, vfClip * 100f, vfMedian, eff) +
-                        "$reprocNote · HDR: luces comprimidas, sombras +%.1f pasos · ".format(lift) +
+                    lastShotInfo = "Última: FOTO · $info (−%.1f EV; visor quemado %.1f %%, mediana %.0f) · ${m.frames}+${unders.size} cuadros (efectivos %.1f) · desplaz. máx ${m.maxShift} px\n".format(ecStops, vfClip * 100f, vfMedian, eff) +
+                        "$reprocNote · $hlNote" + "sombras +%.1f pasos · ".format(lift) +
                         "ruido por cuadro %.1f → %.1f · nitidez ×%.2f/×%.2f · ".format(m.noiseSigma, m.noiseSigma / kotlin.math.sqrt(eff), dp.gFine, dp.gMid) +
                         (if (gm != null) "Ultra HDR ×%.1f (curva de la stock)".format(boost) else "Ultra HDR apagado") +
                         " · %.1f s".format(secs)
@@ -1725,7 +1733,7 @@ class MainActivity : Activity(), SensorEventListener {
                 } catch (t: Throwable) {
                     say("Foto: ${t.javaClass.simpleName} ${t.message}")
                 } finally {
-                    merger = null; under = null
+                    merger = null; unders.clear()
                     if (stockShot === this@BurstShot) stockShot = null
                 }
             }

@@ -210,6 +210,35 @@ class YuvMerger(val w: Int, val h: Int) {
             ByteArray(cw * chh) { (v[it] + 0.5f).toInt().coerceIn(0, 255).toByte() })
     }
 
+    /**
+     * Alinea un cuadro de otra exposición (la toma oscura para las luces) a la referencia y lo devuelve ya
+     * deformado. El bitmap por mediana no depende de la exposición; para el ajuste por zonas se iguala el brillo.
+     */
+    fun warpToRef(f: YuvFrame): YuvFrame {
+        val r = ref ?: return f
+        require(f.w == w && f.h == h) { "cuadro de otro tamaño" }
+        val (code0, _, _) = yuvLumaCode(f)
+        val mr = median(refCode!!); val mf = median(code0)
+        val k = if (mf > 0.004f) mr / mf else 1f
+        val code = FloatArray(code0.size) { (code0[it] * k).coerceAtMost(1f) }
+        val th = median(code)
+        val g = estimateShift(refBits!!, refMask!!, mtb(code, th), mtbMask(code, th), sw, sh)
+        val tiles = tileShifts(refCode!!, code, sw, sh, g[0], g[1])
+        val sm = buildShiftMap(tiles, w, h, 4, false)
+        val yo = ByteArray(w * h)
+        val uo = ByteArray(cw * chh); val vo = ByteArray(cw * chh)
+        for (yy in 0 until h) for (xx in 0 until w) {
+            val bi = sm.idx(xx, yy)
+            val sx = (xx + sm.dx[bi]).coerceIn(0, w - 1); val sy = (yy + sm.dy[bi]).coerceIn(0, h - 1)
+            yo[yy * w + xx] = f.y[sy * w + sx]
+            if ((yy and 1) == 0 && (xx and 1) == 0) {
+                val ci = (yy shr 1) * cw + (xx shr 1); val si = (sy shr 1) * cw + (sx shr 1)
+                uo[ci] = f.u[si]; vo[ci] = f.v[si]
+            }
+        }
+        return YuvFrame(w, h, yo, uo, vo)
+    }
+
     /** Cuántos cuadros aportaron en promedio (después de descartar lo que se movió). */
     fun effectiveFrames(): Float {
         var s = 0.0; var c = 0
@@ -308,7 +337,11 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
         val lin = srgbToLinF(i / 16384f) * ecGain
         (Math.log((lin + 1e-4).toDouble()) / Math.log(2.0)).toFloat()
     }
-    val l = FloatArray(n) { i -> logLut[(y[i] * (16384f / 255f) + 0.5f).toInt().coerceIn(0, 16384)] }
+    val l2ec = (Math.log(ecGain.toDouble()) / Math.log(2.0)).toFloat()
+    // arriba de 255 (luces recuperadas de la toma oscura) la luma codifica lineal^(1/2.4)
+    val l = FloatArray(n) { i -> val v = y[i]
+        if (v > 255f) 2.4f * (Math.log((v / 255f).toDouble()) / Math.log(2.0)).toFloat() + l2ec
+        else logLut[(v * (16384f / 255f) + 0.5f).toInt().coerceIn(0, 16384)] }
     // tabla de salida: log2 lineal (-14..+4, pasos de 1/512) -> luma 0..255, con hombro suave arriba de 0.8
     val outLut = FloatArray(18 * 512 + 1) { i ->
         var lin = Math.pow(2.0, -14.0 + i / 512.0).toFloat()
@@ -528,4 +561,72 @@ fun reprocessMix(merged: YuvFrame, chip: YuvFrame, keep: Float): Triple<FloatArr
     val low = binomial5(d, chip.w, chip.h)
     val y = FloatArray(n) { i -> ((chip.y[i].toInt() and 255) - (1f - keep) * (d[i] - low[i])).coerceIn(0f, 255f) }
     return Triple(y, chip.u, chip.v)
+}
+
+
+private fun smooth01(a: Float, b: Float, x: Float): Float { val t = ((x - a) / (b - a)).coerceIn(0f, 1f); return t * t * (3f - 2f * t) }
+
+/**
+ * HDR por horquillado (como Open Camera / las cámaras con YUV de 8 bits): donde la foto normal se quema, se usan
+ * las luces de una toma más oscura ya alineada. La relación de brillo entre las dos se mide en la propia foto
+ * (zonas que no se queman en ninguna), así no depende de la curva del chip. La luma resultante puede pasar de 255
+ * (= más brillante que el blanco de la foto normal, codificada lineal^(1/2.4)); después el mapeo de tonos la
+ * comprime. Devuelve el % de la foto que tomó luces de la toma oscura (0 si no se pudo usar).
+ */
+fun fuseHighlights(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, under: YuvFrame): Float {
+    val lin = FloatArray(256) { srgbToLinF(it / 255f) }
+    // relación de exposición: mediana de lin(normal)/lin(oscura) en zonas medias-claras
+    val hist = IntArray(400) // log2 de la relación, 0..10 pasos en 1/40
+    var cnt = 0
+    var i = 0
+    while (i < w * h) {
+        val n = y[i].toInt().coerceIn(0, 255); val d = under.y[i].toInt() and 255
+        if (n in 110..225 && d > 10) {
+            val rr = lin[n] / lin[d]
+            val b = (Math.log(rr.toDouble()) / Math.log(2.0) * 40).toInt()
+            if (b in 0 until 400) { hist[b]++; cnt++ }
+        }
+        i += 13
+    }
+    if (cnt < 200) return 0f
+    var acc = 0; var mb = 0
+    while (mb < 399 && acc + hist[mb] < cnt / 2) { acc += hist[mb]; mb++ }
+    val ratio = Math.pow(2.0, mb / 40.0).toFloat()
+    // peso suave: máximo de la luma normal en bloques de 4x4, suavizado (sin bordes duros ni puntos sueltos)
+    val s = 4
+    val ws = (w + s - 1) / s; val hs = (h + s - 1) / s
+    val mx = FloatArray(ws * hs)
+    for (yy in 0 until h) for (xx in 0 until w) { val k = (yy / s) * ws + xx / s; if (y[yy * w + xx] > mx[k]) mx[k] = y[yy * w + xx] }
+    val wsm = boxMean(FloatArray(ws * hs) { smooth01(200f, 245f, mx[it]) }, ws, hs, 2)
+    val cw = (w + 1) / 2
+    var used = 0
+    for (yy in 0 until h) {
+        val fy = ((yy + 0.5f) / s - 0.5f).coerceIn(0f, (hs - 1).toFloat())
+        val y0 = fy.toInt().coerceAtMost(hs - 1); val y1 = minOf(y0 + 1, hs - 1); val ty = fy - y0
+        for (xx in 0 until w) {
+            val fx = ((xx + 0.5f) / s - 0.5f).coerceIn(0f, (ws - 1).toFloat())
+            val x0 = fx.toInt().coerceAtMost(ws - 1); val x1 = minOf(x0 + 1, ws - 1); val tx = fx - x0
+            var wt = (wsm[y0 * ws + x0] * (1 - tx) + wsm[y0 * ws + x1] * tx) * (1 - ty) + (wsm[y1 * ws + x0] * (1 - tx) + wsm[y1 * ws + x1] * tx) * ty
+            if (wt <= 0.01f) continue
+            val idx = yy * w + xx
+            val n = y[idx].toInt().coerceIn(0, 255); val d = under.y[idx].toInt() and 255
+            val linN = lin[n]; val linU = lin[d] * ratio
+            // movimiento o mala alineación: la oscura no puede dar menos luz que la normal casi quemada
+            if (linU < linN * 0.7f) wt *= 0.2f
+            val linF = linN + (linU - linN) * wt
+            val yF = if (linF <= 1f) linToSrgbF(linF) * 255f else 255f * Math.pow(linF.toDouble(), 1 / 2.4).toFloat()
+            y[idx] = yF
+            if (wt > 0.5f) used++
+            if ((yy and 1) == 0 && (xx and 1) == 0) {
+                val ci = (yy shr 1) * cw + (xx shr 1)
+                // color de la toma oscura (no está quemado), escalado a la nueva luma
+                val kc = (yF / maxOf(d.toFloat(), 4f)).coerceAtMost(3f)
+                val uu = (u[ci].toInt() and 255) - 128f; val vv = (v[ci].toInt() and 255) - 128f
+                val uD = ((under.u[ci].toInt() and 255) - 128f) * kc; val vD = ((under.v[ci].toInt() and 255) - 128f) * kc
+                u[ci] = (128f + uu + (uD - uu) * wt).toInt().coerceIn(0, 255).toByte()
+                v[ci] = (128f + vv + (vD - vv) * wt).toInt().coerceIn(0, 255).toByte()
+            }
+        }
+    }
+    return used * 100f / (w * h)
 }
