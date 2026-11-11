@@ -297,7 +297,7 @@ private fun linToSrgbF(l: Float): Float { val x = l.coerceIn(0f, 1f); return if 
  *  rangeTarget: rango de iluminación (en pasos) al que se comprime la escena; strength 0..1;
  *  maxLift: lo máximo que se sube una zona (en pasos), con tope suave.
  */
-fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarget: Float = 3.2f, maxLift: Float = 1.8f, exposureComp: Float = 0f): Float {
+fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarget: Float = 3.2f, maxLift: Float = 1.8f, exposureComp: Float = 0f, noiseSigma: Float = 0f): Float {
     if (strength <= 0f) return 0f
     val n = w * h
     val lut = FloatArray(4096) { i -> srgbToLinF(i / 4095f) }
@@ -340,7 +340,8 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
     val lo = sorted[(sorted.size * 0.02).toInt()]
     val range = (hi - lo).coerceAtLeast(0.1f)
     val c = (1f - strength * (1f - (rangeTarget / range).coerceIn(0.45f, 1f)))
-    // aplicar a resolución completa (a y b interpolados)
+    // aplicar a resolución completa (a y b interpolados); se guarda la suba de cada pixel (pasos × 64)
+    val gainQ = if (noiseSigma > 0f) ByteArray(n) else null
     var liftAcc = 0.0; var liftN = 0
     for (yy in 0 until h) {
         val fy = ((yy + 0.5f) / s - 0.5f).coerceIn(0f, (hs - 1).toFloat())
@@ -360,10 +361,35 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
             val raw = (newBase - base).coerceAtLeast(0f)
             val gain = maxLift * kotlin.math.tanh(raw / maxLift)
             if (base < lo + range * 0.4f) { liftAcc += gain; liftN++ }
+            if (gainQ != null) gainQ[i] = (gain * 64f).toInt().coerceIn(0, 127).toByte()
             y[i] = outLut[(((l[i] + gain) + 14f) * 512f).toInt().coerceIn(0, outLut.size - 1)]
         }
     }
+    if (gainQ != null) shadowDenoise(y, w, h, gainQ, noiseSigma)
     return if (liftN > 0) (liftAcc / liftN).toFloat() else 0f
+}
+
+/**
+ * Limpieza de ruido proporcional a cuánto se subió cada zona: al levantar las sombras también se levanta su
+ * ruido, así que el umbral crece con la suba (encogimiento suave del detalle fino respecto de un 3x3 binomial).
+ */
+private fun shadowDenoise(y: FloatArray, w: Int, h: Int, gainQ: ByteArray, sigma: Float) {
+    val tLut = FloatArray(128) { q -> val t = 2f * sigma * Math.pow(2.0, 0.7 * q / 64.0).toFloat(); t * t }
+    val prev = FloatArray(w); val cur = FloatArray(w); val next = FloatArray(w)
+    System.arraycopy(y, 0, cur, 0, w)
+    System.arraycopy(y, if (h > 1) w else 0, prev, 0, w) // espejo arriba
+    for (r in 0 until h) {
+        System.arraycopy(y, (if (r + 1 < h) r + 1 else r - 1).coerceAtLeast(0) * w, next, 0, w)
+        val base = r * w
+        for (x in 0 until w) {
+            val xm = if (x > 0) x - 1 else 1; val xp = if (x < w - 1) x + 1 else w - 2
+            val b = (prev[xm] + 2f * prev[x] + prev[xp] + 2f * (cur[xm] + cur[xp]) + 4f * cur[x] + next[xm] + 2f * next[x] + next[xp]) * 0.0625f
+            val d = cur[x] - b
+            val t2 = tLut[gainQ[base + x].toInt()]
+            y[base + x] = b + d * (d * d / (d * d + t2))
+        }
+        System.arraycopy(cur, 0, prev, 0, w); System.arraycopy(next, 0, cur, 0, w)
+    }
 }
 
 
@@ -377,12 +403,12 @@ fun YuvMerger.resultPlanes(): Triple<FloatArray, ByteArray, ByteArray> {
  * Mapeo de tonos local + conversión a ARGB. El croma se escala con la luma para que el color no se apague
  * en las sombras levantadas. Devuelve los pixeles y cuánto se subieron las sombras (pasos).
  */
-fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exposureComp: Float, maxLift: Float): Pair<IntArray, Float> {
+fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exposureComp: Float, maxLift: Float, noiseSigma: Float = 0f): Pair<IntArray, Float> {
     val old = y.copyOf()
-    val lift = localToneMap(y, w, h, 1f, 3.2f, maxLift, exposureComp)
+    val lift = localToneMap(y, w, h, 1f, 3.2f, maxLift, exposureComp, noiseSigma)
     val cw = (w + 1) / 2
     val out = IntArray(w * h)
-    val kLut = FloatArray(1025) { Math.pow(it / 256.0, 0.8).toFloat().coerceIn(0.5f, 4f) } // relación 0..4
+    val kLut = FloatArray(1025) { Math.pow(it / 256.0, 0.6).toFloat().coerceIn(0.5f, 4f) } // relación 0..4
     for (yy in 0 until h) {
         val crow = (yy shr 1) * cw
         for (xx in 0 until w) {
@@ -404,3 +430,13 @@ fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exp
 /** Planos para el revelado a partir de un cuadro (por ejemplo, el que devuelve el reproceso del chip). */
 fun YuvFrame.planes(): Triple<FloatArray, ByteArray, ByteArray> =
     Triple(FloatArray(w * h) { (y[it].toInt() and 255).toFloat() }, u, v)
+
+
+/** Mezcla dos cuadros del mismo tamaño: a + alfa·(b − a). */
+fun blendYuv(a: YuvFrame, b: YuvFrame, alpha: Float): YuvFrame {
+    fun mix(x: ByteArray, z: ByteArray) = ByteArray(x.size) { i ->
+        val p = (x[i].toInt() and 255).toFloat(); val q = (z[i].toInt() and 255).toFloat()
+        (p + alpha * (q - p) + 0.5f).toInt().coerceIn(0, 255).toByte()
+    }
+    return YuvFrame(a.w, a.h, mix(a.y, b.y), mix(a.u, b.u), mix(a.v, b.v))
+}

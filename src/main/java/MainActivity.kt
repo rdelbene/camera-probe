@@ -1622,11 +1622,13 @@ class MainActivity : Activity(), SensorEventListener {
                     // Reproceso: la foto fusionada vuelve al chip, que aplica la reducción de ruido y la nitidez
                     // de Motorola sabiendo que ahora tiene ~eff veces menos ruido.
                     var reprocNote = "sin reproceso"
+                    var mergedClean: YuvFrame? = null
                     var planes: Triple<FloatArray, ByteArray, ByteArray>? = null
                     val wr = imageWriter; val ref = refResult; val sess = session; val tgt = reader?.surface; val dev = device
                     if (wr != null && ref != null && sess != null && tgt != null && dev != null && sess.isReprocessable) {
                         try {
                             val merged = m.result(false)
+                            mergedClean = merged
                             val img = wr.dequeueInputImage()
                             fillYuvImage(img, merged)
                             img.timestamp = ref.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L
@@ -1639,7 +1641,12 @@ class MainActivity : Activity(), SensorEventListener {
                             rb.set(CaptureRequest.REPROCESS_EFFECTIVE_EXPOSURE_FACTOR, eff)
                             sess.capture(rb.build(), null, camHandler)
                             if (reprocLatch.await(6, java.util.concurrent.TimeUnit.SECONDS)) {
-                                reprocFrame?.let { planes = it.planes(); reprocNote = "reproceso del chip ✓" }
+                                reprocFrame?.let { rf ->
+                                    // el chip afila demasiado para una foto fusionada: se usa un 55 % de su procesado
+                                    val mc = mergedClean
+                                    val mixed = if (mc != null && mc.w == rf.w && mc.h == rf.h) blendYuv(mc, rf, 0.55f) else rf
+                                    planes = mixed.planes(); reprocNote = "reproceso del chip ✓ (55 %)"
+                                }
                             } else reprocNote = "reproceso sin respuesta"
                         } catch (e: Exception) {
                             reprocNote = "reproceso falló: ${e.javaClass.simpleName}"
@@ -1650,12 +1657,13 @@ class MainActivity : Activity(), SensorEventListener {
                     val reprocessed = planes != null
                     val (yF, uB, vB) = planes ?: m.resultPlanes()
                     // revelado: compensa la subexposición y sube las sombras localmente (sin halos)
-                    val (px, lift) = toneMapToArgb(yF, uB, vB, w, h, ecStops, 1.6f)
+                    val sigmaLevels = (m.noiseSigma / kotlin.math.sqrt(eff)).coerceAtLeast(0.8f)
+                    val (px, lift) = toneMapToArgb(yF, uB, vB, w, h, ecStops, 1.3f, sigmaLevels)
                     // ruido que queda (0..1); en las sombras levantadas es mayor
                     val sigmaOut = (m.noiseSigma / 255f / kotlin.math.sqrt(eff) * (1f + 0.5f * lift)).coerceIn(0f, 0.05f)
                     val stock = StockProfiles.forLens(lensName)
                     // si el chip ya hizo la reducción de ruido y la nitidez, solo un toque para compensar la suba de sombras
-                    val dp = if (reprocessed) DetailParams(1.1f, 1.05f, 1f, sigmaOut * 1.5f, 0f)
+                    val dp = if (reprocessed) DetailParams(1f, 1f, 1f, 0f, 0f) // el chip ya puso la nitidez
                         else detailParamsFor(sigmaOut, false, 0, 0, stock.sharpMul, stock.nrMul)
                     detailEnhance(px, w, h, dp)
 
