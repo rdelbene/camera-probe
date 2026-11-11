@@ -1529,8 +1529,8 @@ class MainActivity : Activity(), SensorEventListener {
                 setTag(tag)
             }.build()
             val reqs = MutableList(frames) { req(t, iso, "n") }
-            if (withUnder) {
-                // toma para el Ultra HDR: 3 pasos por debajo de lo que midió el visor
+            if (false) {
+                // (ya no se usa: el Ultra HDR sigue la curva de la stock) toma 3 pasos por debajo del visor
                 val total = t0.toDouble() * iso0 / 8.0
                 val tu = (total / isoMin).toLong().coerceAtMost(t).coerceIn(expMin, expMax)
                 val iu = (total / tu).roundToInt().coerceIn(isoMin, isoMax)
@@ -1553,7 +1553,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     inner class BurstShot(val n: Int, val withUnder: Boolean, val boost: Float, val lensName: String, val ecStops: Float) {
-        private val expected = n + if (withUnder) 1 else 0
+        private val expected = n
         private val tagByTs = java.util.concurrent.ConcurrentHashMap<Long, String>()
         @Volatile private var got = 0
         @Volatile private var normalExposure = 0.0
@@ -1578,7 +1578,7 @@ class MainActivity : Activity(), SensorEventListener {
             if (done) return
             val idx = got++
             val tag = tagByTs[ts]
-            if (withUnder && (tag == "under" || (tag == null && idx >= n))) {
+            if (tag == "under") {
                 under = f
             } else {
                 mergeExec.execute {
@@ -1642,10 +1642,11 @@ class MainActivity : Activity(), SensorEventListener {
                             sess.capture(rb.build(), null, camHandler)
                             if (reprocLatch.await(6, java.util.concurrent.TimeUnit.SECONDS)) {
                                 reprocFrame?.let { rf ->
-                                    // el chip afila demasiado para una foto fusionada: se usa un 55 % de su procesado
+                                    // tono, contraste y color del chip; de su detalle fino solo el 55 % (afila de más
+                                    // una foto que ya viene fusionada)
                                     val mc = mergedClean
-                                    val mixed = if (mc != null && mc.w == rf.w && mc.h == rf.h) blendYuv(mc, rf, 0.55f) else rf
-                                    planes = mixed.planes(); reprocNote = "reproceso del chip ✓ (55 %)"
+                                    planes = if (mc != null && mc.w == rf.w && mc.h == rf.h) reprocessMix(mc, rf, 0.55f) else rf.planes()
+                                    reprocNote = "reproceso del chip ✓"
                                 }
                             } else reprocNote = "reproceso sin respuesta"
                         } catch (e: Exception) {
@@ -1658,7 +1659,7 @@ class MainActivity : Activity(), SensorEventListener {
                     val (yF, uB, vB) = planes ?: m.resultPlanes()
                     // revelado: compensa la subexposición y sube las sombras localmente (sin halos)
                     val sigmaLevels = (m.noiseSigma / kotlin.math.sqrt(eff)).coerceAtLeast(0.8f)
-                    val (px, lift) = toneMapToArgb(yF, uB, vB, w, h, ecStops, 1.3f, sigmaLevels)
+                    val (px, lift) = toneMapToArgb(yF, uB, vB, w, h, ecStops, 1.5f, sigmaLevels)
                     // ruido que queda (0..1); en las sombras levantadas es mayor
                     val sigmaOut = (m.noiseSigma / 255f / kotlin.math.sqrt(eff) * (1f + 0.5f * lift)).coerceIn(0f, 0.05f)
                     val stock = StockProfiles.forLens(lensName)
@@ -1667,18 +1668,12 @@ class MainActivity : Activity(), SensorEventListener {
                         else detailParamsFor(sigmaOut, false, 0, 0, stock.sharpMul, stock.nrMul)
                     detailEnhance(px, w, h, dp)
 
-                    // Ultra HDR: toma oscura contra la fusionada
-                    val u = under
-                    // la foto final equivale a la exposición de la ráfaga compensada (+ecStops)
-                    val ratio = if (u != null && underExposure > 0.0 && normalExposure > 0.0)
-                        (normalExposure / underExposure * Math.pow(2.0, ecStops.toDouble())).toFloat() else 0f
+                    // Ultra HDR como la stock: el gain map sigue la misma curva según el brillo de cada zona
                     var gm: ByteArray? = null
                     var gw = 0; var gh = 0
-                    if (u != null && ratio > 1f && u.w == w && u.h == h) {
-                        val (sa, sw, sh) = argbSmall(px, w, h, 4)
-                        val (ub, _, _) = yuvToArgbSmall(u, 4)
-                        gm = stockGainMap(sa, ub, sw, sh, ratio, boost)
-                        gw = sw; gh = sh
+                    if (withUnder && boost > 1.01f) {
+                        val (g, sw, sh) = stockCurveGainMap(px, w, h)
+                        gm = g; gw = sw; gh = sh
                     }
                     val out = encodeUltraHdr(px, w, h, gm, gw, gh, boost)
                     val uri = saveImage(out, "IMG_${stamp()}_$lensName.jpg")
@@ -1688,7 +1683,7 @@ class MainActivity : Activity(), SensorEventListener {
                     lastShotInfo = "Última: FOTO · $info (−%.1f EV) · ${m.frames} cuadros (efectivos %.1f) · desplaz. máx ${m.maxShift} px\n".format(ecStops, eff) +
                         "$reprocNote · sombras +%.1f pasos · ".format(lift) +
                         "ruido por cuadro %.1f → %.1f · nitidez ×%.2f/×%.2f · ".format(m.noiseSigma, m.noiseSigma / kotlin.math.sqrt(eff), dp.gFine, dp.gMid) +
-                        (if (gm != null) "Ultra HDR ×%.1f".format(boost) else if (withUnder) "sin luces que realzar" else "Ultra HDR apagado") +
+                        (if (gm != null) "Ultra HDR ×%.1f (curva de la stock)".format(boost) else "Ultra HDR apagado") +
                         " · %.1f s".format(secs)
                     refreshInfo()
                     say("Guardada")
@@ -2121,9 +2116,10 @@ class MainActivity : Activity(), SensorEventListener {
                 detailEnhance(px, w, h, dParams)
                 detailNote = "realce JPEG ×%.2f/×%.2f".format(dParams.gFine, dParams.gMid)
             }
+            val sg = if (makeGain && k > 0f) stockCurveGainMap(px, w, h) else null
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             bmp.setPixels(px, 0, w, 0, 0, w, h)
-            return encode(bmp, gm, gw, gh, g.pow(k))
+            return encode(bmp, sg?.first, sg?.second ?: 0, sg?.third ?: 0, STOCK_UHDR_MAX.pow(k))
         }
 
         /** Revelado del RAW fusionado: negro/blanco, sombreado del lente, balance, demosaico, matriz de color y tono. */
@@ -2221,10 +2217,11 @@ class MainActivity : Activity(), SensorEventListener {
                 if (look) " · estilo Motorola" else "",
                 (if (lsm == null) " · sombreado estimado" else "") + (if (ccmT == null) " · color de la stock" else ""))
 
+            // Ultra HDR con la curva de la stock (igual que en Foto)
+            val sg = if (makeGain && k > 0f) stockCurveGainMap(px, w, h) else null
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             bmp.setPixels(px, 0, w, 0, 0, w, h)
-            val gm = if (cell != null) gainBytes(cell, gw, gh, bigG, tone) else null
-            return encode(bmp, gm, gw, gh, bigG.pow(k))
+            return encode(bmp, sg?.first, sg?.second ?: 0, sg?.third ?: 0, STOCK_UHDR_MAX.pow(k))
         }
 
         /** Gira, adjunta el gain map (si hay) y comprime. */

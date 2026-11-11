@@ -408,7 +408,7 @@ fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exp
     val lift = localToneMap(y, w, h, 1f, 3.2f, maxLift, exposureComp, noiseSigma)
     val cw = (w + 1) / 2
     val out = IntArray(w * h)
-    val kLut = FloatArray(1025) { Math.pow(it / 256.0, 0.6).toFloat().coerceIn(0.5f, 4f) } // relación 0..4
+    val kLut = FloatArray(1025) { Math.pow(it / 256.0, 0.7).toFloat().coerceIn(0.5f, 4f) } // relación 0..4
     for (yy in 0 until h) {
         val crow = (yy shr 1) * cw
         for (xx in 0 until w) {
@@ -439,4 +439,78 @@ fun blendYuv(a: YuvFrame, b: YuvFrame, alpha: Float): YuvFrame {
         (p + alpha * (q - p) + 0.5f).toInt().coerceIn(0, 255).toByte()
     }
     return YuvFrame(a.w, a.h, mix(a.y, b.y), mix(a.u, b.u), mix(a.v, b.v))
+}
+
+
+// ---------------------------------------------------------------------- Ultra HDR como la stock
+
+/**
+ * Curva del gain map de la cámara stock, medida en sus fotos (correlación 0.98 con la luma SDR):
+ * luma SDR (centro de cada tramo) -> valor del gain map (0..255, donde 255 = máximo del Ultra HDR).
+ */
+private val STOCK_GAIN_X = floatArrayOf(0f, 24f, 40f, 56f, 72f, 88f, 104f, 120f, 136f, 152f, 168f, 184f, 200f, 216f, 232f, 255f)
+private val STOCK_GAIN_Y = floatArrayOf(0f, 0f, 3f, 56f, 82f, 96f, 105f, 111f, 121f, 138f, 155f, 185f, 210f, 241f, 255f, 255f)
+
+fun stockGainCurve(luma: Float): Float {
+    if (luma <= STOCK_GAIN_X[0]) return STOCK_GAIN_Y[0]
+    for (k in 1 until STOCK_GAIN_X.size) {
+        if (luma <= STOCK_GAIN_X[k]) {
+            val t = (luma - STOCK_GAIN_X[k - 1]) / (STOCK_GAIN_X[k] - STOCK_GAIN_X[k - 1])
+            return STOCK_GAIN_Y[k - 1] + t * (STOCK_GAIN_Y[k] - STOCK_GAIN_Y[k - 1])
+        }
+    }
+    return 255f
+}
+
+/** Gain map a 1/4 de resolución con la curva de la stock, a partir de la imagen final (ARGB). */
+fun stockCurveGainMap(px: IntArray, w: Int, h: Int, step: Int = 4): Triple<ByteArray, Int, Int> {
+    val gw = w / step; val gh = h / step
+    val lut = FloatArray(256) { stockGainCurve(it.toFloat()) }
+    val g = FloatArray(gw * gh)
+    for (gy in 0 until gh) for (gx in 0 until gw) {
+        var acc = 0f
+        for (dy in 0 until step) {
+            val row = (gy * step + dy) * w + gx * step
+            for (dx in 0 until step) {
+                val p = px[row + dx]
+                acc += (77 * ((p shr 16) and 255) + 150 * ((p shr 8) and 255) + 29 * (p and 255)) shr 8
+            }
+        }
+        g[gy * gw + gx] = lut[(acc / (step * step)).toInt().coerceIn(0, 255)]
+    }
+    val b = binomial3(g, gw, gh)
+    return Triple(ByteArray(gw * gh) { (b[it] + 0.5f).toInt().coerceIn(0, 255).toByte() }, gw, gh)
+}
+
+// ---------------------------------------------------------------------- mezcla del reproceso
+
+/** Desenfoque binomial 5x5 ([1 4 6 4 1] separable) de un plano en float. */
+fun binomial5(src: FloatArray, w: Int, h: Int): FloatArray {
+    val tmp = FloatArray(src.size)
+    for (y in 0 until h) {
+        val b = y * w
+        for (x in 0 until w) {
+            tmp[b + x] = (src[b + reflect(x - 2, w)] + 4f * src[b + reflect(x - 1, w)] + 6f * src[b + x] +
+                4f * src[b + reflect(x + 1, w)] + src[b + reflect(x + 2, w)]) * 0.0625f
+        }
+    }
+    val out = FloatArray(src.size)
+    for (y in 0 until h) {
+        val r0 = reflect(y - 2, h) * w; val r1 = reflect(y - 1, h) * w; val r2 = y * w
+        val r3 = reflect(y + 1, h) * w; val r4 = reflect(y + 2, h) * w
+        for (x in 0 until w) out[r2 + x] = (tmp[r0 + x] + 4f * tmp[r1 + x] + 6f * tmp[r2 + x] + 4f * tmp[r3 + x] + tmp[r4 + x]) * 0.0625f
+    }
+    return out
+}
+
+/**
+ * Del reproceso del chip se toma todo (tono, contraste y color de Motorola) salvo parte de su detalle fino:
+ * y = yChip − (1 − keep)·altas_frecuencias(yChip − yFusión). keep = 1 deja el reproceso tal cual.
+ */
+fun reprocessMix(merged: YuvFrame, chip: YuvFrame, keep: Float): Triple<FloatArray, ByteArray, ByteArray> {
+    val n = chip.w * chip.h
+    val d = FloatArray(n) { ((chip.y[it].toInt() and 255) - (merged.y[it].toInt() and 255)).toFloat() }
+    val low = binomial5(d, chip.w, chip.h)
+    val y = FloatArray(n) { i -> ((chip.y[i].toInt() and 255) - (1f - keep) * (d[i] - low[i])).coerceIn(0f, 255f) }
+    return Triple(y, chip.u, chip.v)
 }
