@@ -9,10 +9,13 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.Gainmap
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.graphics.SurfaceTexture
+import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -22,18 +25,22 @@ import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.view.GestureDetector
+import android.view.MotionEvent
 import android.provider.MediaStore
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
@@ -50,6 +57,7 @@ import java.util.concurrent.Executor
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
@@ -82,7 +90,19 @@ class MainActivity : Activity() {
     private var lens = Lens.MAIN
     private var physicalMode = false
     private var burstN = 3
-    private var fusionMode = false
+    /** 0 = desactivado (JPEG común), 1 = activo (Ultra HDR del fabricante), 2 = mejorado (fusión por ráfaga) */
+    private var hdrMode = 1
+    private val fusionMode get() = hdrMode == 2
+    private var pendingMode = 1
+    private lateinit var photoBtn: Button
+
+    // Foco por toque
+    private lateinit var focusRing: View
+    @Volatile private var focusRegion: MeteringRectangle? = null
+    @Volatile private var afWatching = false
+    private var activeArray: Rect? = null
+    private var maxAfRegions = 0
+    private var maxAeRegions = 0
     private var vMfnr = false
     private var vMfhdr = false
     private var vShdr = false
@@ -143,6 +163,7 @@ class MainActivity : Activity() {
                 prefs.getInt("${l.name}_hdr2", 100)
             )
         }
+        hdrMode = prefs.getInt("hdrMode", 1).coerceIn(0, 2)
         buildUi()
     }
 
@@ -219,7 +240,26 @@ class MainActivity : Activity() {
         }
 
         texture = TextureView(this)
-        root.addView(texture, LinearLayout.LayoutParams(w, w * 4 / 3))
+        val frame = FrameLayout(this)
+        frame.addView(texture, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val ringPx = (resources.displayMetrics.density * 64).toInt()
+        focusRing = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setStroke((resources.displayMetrics.density * 2).toInt(), Color.WHITE)
+            }
+            visibility = View.INVISIBLE
+        }
+        frame.addView(focusRing, FrameLayout.LayoutParams(ringPx, ringPx))
+        root.addView(frame, LinearLayout.LayoutParams(w, w * 4 / 3))
+        val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent) = true
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                focusAt(e.x, e.y, texture.width, texture.height); return true
+            }
+            override fun onLongPress(e: MotionEvent) { resetFocus(true) }
+        })
+        texture.setOnTouchListener { _, e -> gestures.onTouchEvent(e) }
         texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) { openCamera() }
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
@@ -227,11 +267,12 @@ class MainActivity : Activity() {
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
 
-        root.addView(Button(this).apply {
-            text = "FOTO  (Ultra HDR)"
+        photoBtn = Button(this).apply {
             textSize = 18f
             setOnClickListener { takePhoto() }
-        })
+        }
+        root.addView(photoBtn)
+        updatePhotoButton()
 
         status = TextView(this).apply { textSize = 12f; setPadding(24, 8, 24, 8) }
         root.addView(status)
@@ -257,16 +298,29 @@ class MainActivity : Activity() {
         root.addView(lensGroup)
 
         // Modos de captura
+        root.addView(label("HDR"))
+        val hdrGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            setPadding(24, 0, 24, 0)
+        }
+        listOf("Desactivado", "Activo", "Mejorado").forEachIndexed { i, t ->
+            hdrGroup.addView(RadioButton(this).apply {
+                id = View.generateViewId()
+                text = t
+                tag = i
+            })
+        }
+        (hdrGroup.getChildAt(hdrMode) as RadioButton).isChecked = true
+        hdrGroup.setOnCheckedChangeListener { g, id ->
+            val b = g.findViewById<RadioButton>(id) ?: return@setOnCheckedChangeListener
+            hdrMode = b.tag as Int
+            prefs.edit().putInt("hdrMode", hdrMode).apply()
+            updatePhotoButton()
+            if (device != null) startSession()
+        }
+        root.addView(hdrGroup)
         root.addView(Switch(this).apply {
-            text = "Fusión HDR por ráfaga"
-            setPadding(24, 12, 24, 8)
-            setOnCheckedChangeListener { _, checked ->
-                fusionMode = checked
-                if (device != null) startSession()
-            }
-        })
-        root.addView(Switch(this).apply {
-            text = "Ráfaga de 5 fotos (más suave, tarda más)"
+            text = "Mejorado: ráfaga de 5 fotos (más suave, tarda más)"
             setPadding(24, 8, 24, 8)
             setOnCheckedChangeListener { _, checked -> burstN = if (checked) 5 else 3 }
         })
@@ -348,11 +402,97 @@ class MainActivity : Activity() {
 
     private fun selectLens(l: Lens) {
         lens = l
+        focusRegion = null
+        afWatching = false
+        focusRing.visibility = View.INVISIBLE
         refreshControls()
         if (physicalMode) startSession() else updatePreview()
     }
 
     private fun say(msg: String) = runOnUiThread { status.text = msg }
+
+    private fun updatePhotoButton() {
+        photoBtn.text = when (hdrMode) {
+            0 -> "FOTO  (HDR desactivado)"
+            1 -> "FOTO  (HDR activo)"
+            else -> "FOTO  (HDR mejorado)"
+        }
+    }
+
+    // ------------------------------------------------------------------ foco por toque
+
+    private fun focusAt(x: Float, y: Float, vw: Int, vh: Int) {
+        val arr = activeArray ?: return
+        if (session == null || vw <= 0 || vh <= 0) return
+        if (maxAfRegions <= 0 && maxAeRegions <= 0) { say("Este lente no admite foco por toque"); return }
+        val nx = (x / vw).coerceIn(0f, 1f)
+        val ny = (y / vh).coerceIn(0f, 1f)
+        // Pantalla vertical -> coordenadas del sensor (apaisado)
+        val (sx, sy) = when (sensorOrientation) {
+            90 -> ny to 1f - nx
+            180 -> 1f - nx to 1f - ny
+            270 -> 1f - ny to nx
+            else -> nx to ny
+        }
+        val aw = arr.width()
+        val ah = arr.height()
+        val size = (min(aw, ah) * 0.12f).toInt()
+        val l = ((sx * aw).toInt() - size / 2).coerceIn(0, aw - size)
+        val t = ((sy * ah).toInt() - size / 2).coerceIn(0, ah - size)
+        focusRegion = MeteringRectangle(l, t, size, size, MeteringRectangle.METERING_WEIGHT_MAX)
+
+        focusRing.translationX = x - focusRing.width / 2f
+        focusRing.translationY = y - focusRing.height / 2f
+        focusRing.animate().cancel()
+        setRingColor(Color.WHITE)
+        focusRing.alpha = 1f
+        focusRing.visibility = View.VISIBLE
+        camHandler.post { triggerAf() }
+    }
+
+    private fun setRingColor(c: Int) {
+        (focusRing.background as GradientDrawable).setStroke((resources.displayMetrics.density * 2).toInt(), c)
+    }
+
+    private fun triggerAf() {
+        val s = session ?: return
+        val surf = previewSurface ?: return
+        try {
+            val cancel = buildRequest(CameraDevice.TEMPLATE_PREVIEW, surf, true)
+            cancel.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+            s.capture(cancel.build(), null, camHandler)
+            updatePreview()
+            val start = buildRequest(CameraDevice.TEMPLATE_PREVIEW, surf, true)
+            start.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            afWatching = true
+            s.capture(start.build(), previewCb, camHandler)
+            say("Enfocando... (mantené apretado para volver a foco automático)")
+        } catch (e: Exception) {
+            say("Foco: ${e.javaClass.simpleName} ${e.message}")
+        }
+    }
+
+    /** Vuelve al enfoque continuo automático. */
+    private fun resetFocus(announce: Boolean) {
+        val had = focusRegion != null
+        focusRegion = null
+        afWatching = false
+        runOnUiThread { focusRing.visibility = View.INVISIBLE }
+        if (!had) return
+        camHandler.post {
+            val s = session
+            val surf = previewSurface
+            if (s != null && surf != null) {
+                try {
+                    val cancel = buildRequest(CameraDevice.TEMPLATE_PREVIEW, surf, true)
+                    cancel.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                    s.capture(cancel.build(), null, camHandler)
+                } catch (_: Exception) {}
+            }
+            updatePreview()
+            if (announce) say("Foco automático")
+        }
+    }
 
     // ------------------------------------------------------------------ cámara
 
@@ -415,8 +555,14 @@ class MainActivity : Activity() {
             vendorKeys = chars.availableCaptureRequestKeys.map { it.name }.toSet()
             chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { expMin = it.lower; expMax = it.upper }
             chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { isoMin = it.lower; isoMax = it.upper }
+            activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            maxAfRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+            maxAeRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+            focusRegion = null
+            afWatching = false
+            runOnUiThread { focusRing.visibility = View.INVISIBLE }
 
-            val stillFormat = if (fusionMode) ImageFormat.JPEG else ImageFormat.JPEG_R
+            val stillFormat = if (hdrMode == 1) ImageFormat.JPEG_R else ImageFormat.JPEG
             val stillSize = map.getOutputSizes(stillFormat)
                 .filter { it.width * 3 == it.height * 4 && it.width <= 4096 }
                 .maxByOrNull { it.width * it.height }!!
@@ -464,7 +610,14 @@ class MainActivity : Activity() {
         val p = prof()
         b.addTarget(target)
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-        b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        val fr = focusRegion
+        if (fr != null) {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+            if (maxAfRegions > 0) b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(fr))
+            if (maxAeRegions > 0) b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(fr))
+        } else {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        }
         b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, p.exp)
         if (p.nr > 0) b.set(CaptureRequest.NOISE_REDUCTION_MODE, p.nr - 1)
         if (p.edge > 0) b.set(CaptureRequest.EDGE_MODE, p.edge - 1)
@@ -477,6 +630,20 @@ class MainActivity : Activity() {
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
             res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastT = it }
             res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
+            if (afWatching) {
+                when (res.get(CaptureResult.CONTROL_AF_STATE)) {
+                    CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED -> {
+                        afWatching = false
+                        runOnUiThread { setRingColor(Color.GREEN); focusRing.animate().alpha(0.4f).setStartDelay(800).start() }
+                        say("Foco fijado. Mantené apretado para volver a automático.")
+                    }
+                    CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED -> {
+                        afWatching = false
+                        runOnUiThread { setRingColor(Color.RED); focusRing.animate().alpha(0.4f).setStartDelay(800).start() }
+                        say("No pudo enfocar ahí. Probá otro punto o mantené apretado.")
+                    }
+                }
+            }
             // Tras 30 frames sanos, la opción experimental se considera estable
             if (riskySwitch != null && ++okFrames >= 30) { riskySwitch = null; riskyRevert = null }
         }
@@ -489,7 +656,7 @@ class MainActivity : Activity() {
             val req = buildRequest(CameraDevice.TEMPLATE_PREVIEW, surf, !fusionMode).build()
             s.setRepeatingRequest(req, previewCb, camHandler)
             say("${lens.label} · ${if (physicalMode) "físico ${lens.physicalId}" else "lógico"}" +
-                (if (fusionMode) " · fusión" else "") + vendorLog)
+                " · HDR " + arrayOf("desactivado", "activo", "mejorado")[hdrMode] + vendorLog)
         } catch (e: Exception) {
             say("Preview: ${e.javaClass.simpleName} ${e.message}")
         }
@@ -529,6 +696,7 @@ class MainActivity : Activity() {
         try {
             pendingLens = lens
             pendingHdr = prof().hdr
+            pendingMode = hdrMode
             val b = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, r.surface, true)
             b.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
             b.set(CaptureRequest.JPEG_QUALITY, 97.toByte())
@@ -547,8 +715,14 @@ class MainActivity : Activity() {
         } finally {
             img.close()
         }
-        val name = "UHDR_${stamp()}_${pendingLens.name}"
         val hdr = pendingHdr
+        if (pendingMode == 0) {
+            val n = "IMG_${stamp()}_${pendingLens.name}"
+            saveFile(bytes, "$n.jpg")
+            say("Guardada: $n.jpg (sin HDR)")
+            return
+        }
+        val name = "UHDR_${stamp()}_${pendingLens.name}"
         if (hdr == 100) {
             saveFile(bytes, "$name.jpg")
             say("Guardada: $name.jpg")
