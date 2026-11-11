@@ -290,28 +290,31 @@ private fun srgbToLinF(c: Float): Float = if (c <= 0.04045f) c / 12.92f else Mat
 private fun linToSrgbF(l: Float): Float { val x = l.coerceIn(0f, 1f); return if (x <= 0.0031308f) x * 12.92f else 1.055f * Math.pow(x.toDouble(), 1 / 2.4).toFloat() - 0.055f }
 
 /**
- * Mapeo de tonos local sobre la luma (0..255, gamma sRGB), en el lugar. Separa "iluminación" (base, filtro guiado
- * sobre log-luminancia: respeta bordes y no deja halos) y "detalle"; comprime la base hacia las luces para subir
- * las sombras sin tocar las zonas claras, y vuelve a sumar el detalle. Devuelve la ganancia media de las sombras
- * (en pasos) para saber cuánto se amplificó el ruido.
- *  rangeTarget: rango de iluminación (en pasos) al que se comprime la escena; strength 0..1;
- *  maxLift: lo máximo que se sube una zona (en pasos), con tope suave.
+ * Mapeo de tonos local sobre la luma (0..255, gamma sRGB), en el lugar: el HDR de verdad (rango dinámico).
+ * Separa "iluminación" (base: filtro guiado sobre log-luminancia, respeta bordes y no deja halos) y "detalle".
+ * La ráfaga viene subexpuesta (exposureComp pasos) para que las luces no se quemen; acá:
+ *  - los tonos medios vuelven al brillo del visor (+midBoost pasos, como la stock),
+ *  - las luces (ventanas, cielo) se comprimen hasta que entran sin quemarse, conservando su detalle,
+ *  - las sombras se suben poco (hasta maxLift pasos, con tope suave) para que no quede gris y apagada.
+ * Devuelve la suba media de las sombras (en pasos) para saber cuánto se amplificó el ruido.
+ *  rangeTarget: pasos que ocupan las sombras (del percentil 2 a la mediana) después de comprimir.
  */
-fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarget: Float = 3.2f, maxLift: Float = 1.8f, exposureComp: Float = 0f, noiseSigma: Float = 0f): Float {
+fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarget: Float = 4.5f, maxLift: Float = 1.0f, exposureComp: Float = 0f, noiseSigma: Float = 0f, midBoost: Float = 0.2f): Float {
     if (strength <= 0f) return 0f
     val n = w * h
-    val lut = FloatArray(4096) { i -> srgbToLinF(i / 4095f) }
-    // log2 de la luminancia lineal, con la compensación de la subexposición de la ráfaga (hombro suave en las luces)
     val ecGain = Math.pow(2.0, exposureComp.toDouble()).toFloat()
-    // tabla: luma (0..255 en pasos de 1/64) -> log2 de la luminancia lineal compensada
+    // tabla: luma (0..255 en pasos de 1/64) -> log2 de la luminancia lineal compensada (puede pasar de 1: luces)
     val logLut = FloatArray(16385) { i ->
-        var lin = srgbToLinF(i / 16384f) * ecGain
-        if (lin > 0.7f) lin = 0.7f + 0.3f * (1f - kotlin.math.exp(-(lin - 0.7f) / 0.3f))
+        val lin = srgbToLinF(i / 16384f) * ecGain
         (Math.log((lin + 1e-4).toDouble()) / Math.log(2.0)).toFloat()
     }
     val l = FloatArray(n) { i -> logLut[(y[i] * (16384f / 255f) + 0.5f).toInt().coerceIn(0, 16384)] }
-    // tabla de salida: log2 lineal (-14..1, pasos de 1/512) -> luma 0..255 en gamma sRGB
-    val outLut = FloatArray(15 * 512 + 1) { i -> linToSrgbF(Math.pow(2.0, -14.0 + i / 512.0).toFloat()) * 255f }
+    // tabla de salida: log2 lineal (-14..+4, pasos de 1/512) -> luma 0..255, con hombro suave arriba de 0.8
+    val outLut = FloatArray(18 * 512 + 1) { i ->
+        var lin = Math.pow(2.0, -14.0 + i / 512.0).toFloat()
+        if (lin > 0.8f) lin = 0.8f + 0.2f * (1f - kotlin.math.exp(-(lin - 0.8f) / 0.2f))
+        linToSrgbF(lin) * 255f
+    }
     // filtro guiado rápido: coeficientes a resolución 1/4
     val s = 4
     val ws = (w + s - 1) / s; val hs = (h + s - 1) / s
@@ -336,10 +339,12 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
     // percentiles de la base (iluminación)
     val baseSmall = FloatArray(ws * hs) { ma[it] * small[it] + mb[it] }
     val sorted = baseSmall.copyOf(); sorted.sort()
-    val hi = sorted[(sorted.size * 0.995).toInt().coerceAtMost(sorted.size - 1)]
-    val lo = sorted[(sorted.size * 0.02).toInt()]
-    val range = (hi - lo).coerceAtLeast(0.1f)
-    val c = (1f - strength * (1f - (rangeTarget / range).coerceIn(0.45f, 1f)))
+    fun pct(p: Double) = sorted[(sorted.size * p).toInt().coerceIn(0, sorted.size - 1)]
+    val hi = pct(0.995); val lo = pct(0.02); val med = pct(0.5)
+    val medOut = (med + midBoost * strength).coerceAtMost(-1.8f) // la mediana no pasa de ~gris claro
+    val hiOut = -0.25f // luces de la base a ~0.84 lineal (~235): el detalle encima entra en el hombro
+    val cHi = if (hi > med + 0.1f) (1f - strength * (1f - ((hiOut - medOut) / (hi - med)).coerceIn(0.35f, 1f))) else 1f
+    val cLo = if (med - lo > 0.1f) (1f - strength * (1f - (rangeTarget / (med - lo)).coerceIn(0.6f, 1f))) else 1f
     // aplicar a resolución completa (a y b interpolados); se guarda la suba de cada pixel (pasos × 64)
     val gainQ = if (noiseSigma > 0f) ByteArray(n) else null
     var liftAcc = 0.0; var liftN = 0
@@ -356,11 +361,11 @@ fun localToneMap(y: FloatArray, w: Int, h: Int, strength: Float = 1f, rangeTarge
             }
             val i = yy * w + xx
             val base = bil(ma) * l[i] + bil(mb)
-            val newBase = hi + (base - hi) * c
-            // solo sube (nunca baja las luces) y con tope suave: las zonas muy oscuras no se vuelven grises
-            val raw = (newBase - base).coerceAtLeast(0f)
-            val gain = maxLift * kotlin.math.tanh(raw / maxLift)
-            if (base < lo + range * 0.4f) { liftAcc += gain; liftN++ }
+            val newBase = if (base >= med) medOut + (base - med) * cHi else medOut + (base - med) * cLo
+            var gain = newBase - base
+            // la suba tiene tope suave (las zonas muy oscuras siguen oscuras); la bajada de las luces no
+            if (gain > 0f) gain = maxLift * kotlin.math.tanh(gain / maxLift)
+            if (base < lo + (med - lo) * 0.5f) { liftAcc += gain; liftN++ }
             if (gainQ != null) gainQ[i] = (gain * 64f).toInt().coerceIn(0, 127).toByte()
             y[i] = outLut[(((l[i] + gain) + 14f) * 512f).toInt().coerceIn(0, outLut.size - 1)]
         }
@@ -405,7 +410,7 @@ fun YuvMerger.resultPlanes(): Triple<FloatArray, ByteArray, ByteArray> {
  */
 fun toneMapToArgb(y: FloatArray, u: ByteArray, v: ByteArray, w: Int, h: Int, exposureComp: Float, maxLift: Float, noiseSigma: Float = 0f): Pair<IntArray, Float> {
     val old = y.copyOf()
-    val lift = localToneMap(y, w, h, 1f, 3.2f, maxLift, exposureComp, noiseSigma)
+    val lift = localToneMap(y, w, h, 1f, 4.5f, maxLift, exposureComp, noiseSigma)
     val cw = (w + 1) / 2
     val out = IntArray(w * h)
     val kLut = FloatArray(1025) { Math.pow(it / 256.0, 0.7).toFloat().coerceIn(0.5f, 4f) } // relación 0..4

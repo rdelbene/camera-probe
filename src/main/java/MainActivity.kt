@@ -1489,9 +1489,9 @@ class MainActivity : Activity(), SensorEventListener {
 
     /**
      * Foto: el chip procesa cada cuadro (color y tono de Motorola) sin su reducción de ruido ni su nitidez;
-     * la ráfaga va 0.5 a 1 paso subexpuesta para proteger las luces (como HDR+). La app alinea y fusiona
+     * la ráfaga va subexpuesta según cuánto se quema el visor (1 a 3 pasos, como HDR+) para proteger las luces. La app alinea y fusiona
      * 5 a 9 cuadros, sube las sombras con un mapeo de tonos local, limpia el ruido de color, aplica nitidez
-     * sin halos según el ruido que quedó y arma el Ultra HDR con una toma 3 pasos más oscura.
+     * sin halos según el ruido que quedó y arma el Ultra HDR con la curva de la stock.
      */
     private fun shootStock() {
         val s = session ?: return say("Cámara no lista")
@@ -1512,8 +1512,15 @@ class MainActivity : Activity(), SensorEventListener {
             }
             // como HDR+: la ráfaga va subexpuesta para no quemar las luces; después se compensa al revelar.
             // Con poca luz se subexpone menos y se juntan más cuadros.
-            val ecStops = if (iso0 < 800) 1.0f else 0.5f
-            val frames = when { iso0 < 400 -> 5; iso0 < 1600 -> 7; else -> 9 }
+            // medición de luces en el visor: cuanto más quemado está, más se subexpone (hasta 3 pasos con buena luz)
+            val clip = meterHighlights()
+            val ecMax = when { iso0 < 200 -> 3f; iso0 < 400 -> 2.5f; iso0 < 800 -> 2f; iso0 < 1600 -> 1.5f; else -> 1f }
+            val ecBase = if (iso0 < 800) 1.0f else 0.5f
+            val ecStops = if (clip > 0.003f)
+                (ecBase + 0.6f * (Math.log((clip / 0.003f).toDouble()) / Math.log(2.0)).toFloat()).coerceIn(ecBase, ecMax)
+                else ecBase
+            highlightClip = clip
+            val frames = when { iso0 < 400 -> 5; iso0 < 1600 -> 7; else -> 9 } + (if (ecStops >= 2f) 2 else 0)
             val total = t0.toDouble() * iso0 / Math.pow(2.0, ecStops.toDouble())
             val t = (total / isoMin).toLong().coerceAtMost(minOf(t0, 66_666_667L)).coerceIn(expMin, expMax)
             val iso = (total / t).roundToInt().coerceIn(isoMin, isoMax)
@@ -1550,6 +1557,22 @@ class MainActivity : Activity(), SensorEventListener {
             stockShot = null
             say("Foto: ${e.javaClass.simpleName} ${e.message}")
         }
+    }
+
+    @Volatile private var highlightClip = 0f
+
+    /** Fracción del visor quemada (luma ≥ 250), medida sobre una copia chica de la vista previa. */
+    private fun meterHighlights(): Float {
+        val bmp = try { texture.getBitmap(160, 120) } catch (e: Exception) { null } ?: return 0f
+        val px = IntArray(bmp.width * bmp.height)
+        bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+        bmp.recycle()
+        var c = 0
+        for (p in px) {
+            val yv = (77 * ((p shr 16) and 255) + 150 * ((p shr 8) and 255) + 29 * (p and 255)) shr 8
+            if (yv >= 250) c++
+        }
+        return c.toFloat() / px.size.coerceAtLeast(1)
     }
 
     inner class BurstShot(val n: Int, val withUnder: Boolean, val boost: Float, val lensName: String, val ecStops: Float) {
@@ -1659,7 +1682,7 @@ class MainActivity : Activity(), SensorEventListener {
                     val (yF, uB, vB) = planes ?: m.resultPlanes()
                     // revelado: compensa la subexposición y sube las sombras localmente (sin halos)
                     val sigmaLevels = (m.noiseSigma / kotlin.math.sqrt(eff)).coerceAtLeast(0.8f)
-                    val (px, lift) = toneMapToArgb(yF, uB, vB, w, h, ecStops, 1.5f, sigmaLevels)
+                    val (px, lift) = toneMapToArgb(yF, uB, vB, w, h, ecStops, 1.0f, sigmaLevels)
                     // ruido que queda (0..1); en las sombras levantadas es mayor
                     val sigmaOut = (m.noiseSigma / 255f / kotlin.math.sqrt(eff) * (1f + 0.5f * lift)).coerceIn(0f, 0.05f)
                     val stock = StockProfiles.forLens(lensName)
@@ -1680,8 +1703,8 @@ class MainActivity : Activity(), SensorEventListener {
                     if (uri != null) { lastUri = uri; lastMime = "image/jpeg" }
                     setThumb(BitmapFactory.decodeByteArray(out, 0, out.size, BitmapFactory.Options().apply { inSampleSize = 16 }))
                     val secs = (System.currentTimeMillis() - started) / 1000.0
-                    lastShotInfo = "Última: FOTO · $info (−%.1f EV) · ${m.frames} cuadros (efectivos %.1f) · desplaz. máx ${m.maxShift} px\n".format(ecStops, eff) +
-                        "$reprocNote · sombras +%.1f pasos · ".format(lift) +
+                    lastShotInfo = "Última: FOTO · $info (−%.1f EV; visor quemado %.1f %%) · ${m.frames} cuadros (efectivos %.1f) · desplaz. máx ${m.maxShift} px\n".format(ecStops, highlightClip * 100f, eff) +
+                        "$reprocNote · HDR: luces comprimidas, sombras +%.1f pasos · ".format(lift) +
                         "ruido por cuadro %.1f → %.1f · nitidez ×%.2f/×%.2f · ".format(m.noiseSigma, m.noiseSigma / kotlin.math.sqrt(eff), dp.gFine, dp.gMid) +
                         (if (gm != null) "Ultra HDR ×%.1f (curva de la stock)".format(boost) else "Ultra HDR apagado") +
                         " · %.1f s".format(secs)
