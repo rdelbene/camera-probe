@@ -42,6 +42,7 @@ import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaRecorder
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -148,6 +149,8 @@ private fun fmtT(ns: Long): String =
 private val GREEN = Color.rgb(0, 224, 150)
 /** Máximo que pone la cámara stock (1000 nits / 203 nits), medido en sus fotos. */
 private const val STOCK_UHDR_MAX = 4.93f
+/** Cuadros que se fusionan en el modo Foto. */
+private const val BURST = 5
 private val DARK = Color.argb(200, 40, 40, 40)
 
 class MainActivity : Activity(), SensorEventListener {
@@ -188,10 +191,9 @@ class MainActivity : Activity(), SensorEventListener {
     private val nightMode get() = mode == Mode.NOCHE
     private val stockMode get() = mode == Mode.FOTO
     /** Toma en curso del modo Stock (null si no hay). */
-    @Volatile private var stockShot: StockShot? = null
-    /** La sesión actual entrega Ultra HDR nativo (JPEG_R, el mismo mecanismo que la cámara stock). */
-    @Volatile private var jpegRActive = false
-    private val jpegRBlocked = mutableSetOf<String>()
+    @Volatile private var stockShot: BurstShot? = null
+    /** Qué ofrece el celu a apps de terceros (extensiones, Ultra HDR nativo, reproceso). */
+    @Volatile private var capsNote = ""
     private fun busy() = merger != null || stockShot != null
     private var physicalMode = false
     private var nightFrames = 15
@@ -873,7 +875,7 @@ class MainActivity : Activity(), SensorEventListener {
         val what = when {
             videoMode -> "video ${videoSize.height}p $videoFps fps"
             nightMode -> "noche, $nightFrames fotos"
-            else -> "foto del chip + Ultra HDR ${prof().hdr} %" + if (jpegRActive) " (nativo)" else ""
+            else -> "Foto: ráfaga de $BURST cuadros + Ultra HDR ${prof().hdr} %"
         }
         return "${if (lens.front) "Frontal" else lens.label} · $where · $what"
     }
@@ -883,7 +885,7 @@ class MainActivity : Activity(), SensorEventListener {
             val live = if (lastT > 0) "Visor: ${fmtT(lastT)} · ISO $lastIso" else "Visor: midiendo..."
             val lim = "Lente: ${fmtT(expMin.coerceAtLeast(1L))} a ${fmtT(expMax)} · ISO $isoMin a $isoMax · " +
                 (if (rawSupported) "RAW sí" else "RAW no") + " · pulso %.1f°/s".format(Math.toDegrees(gyroW.toDouble()))
-            infoPanel.text = listOf(statusLine(), live, lim, lastShotInfo, (sessionNote + vendorLog).trim())
+            infoPanel.text = listOf(statusLine(), live, lim, lastShotInfo, capsNote, (sessionNote + vendorLog).trim())
                 .filter { it.isNotEmpty() }.joinToString("\n")
         }
     }
@@ -1118,8 +1120,6 @@ class MainActivity : Activity(), SensorEventListener {
             rawReader = null
             rawSupported = false
             rawInfo = null
-            jpegRActive = false
-            hlgSurface = null
             try { recSurface?.release() } catch (_: Exception) {}
             recSurface = null
             sessionNote = ""
@@ -1173,31 +1173,32 @@ class MainActivity : Activity(), SensorEventListener {
                 surfaces += rs
             } else {
                 sessKey = "$camId/${if (usePhysical) lens.physicalId else "L"}/${lens.name}"
-                // Foto: Ultra HDR nativo (JPEG_R) si el sistema lo ofrece; si no, JPEG común + gain map propio
-                val useR = stockMode && sessKey !in jpegRBlocked && supportsJpegR(chars, map)
-                val fmt = if (useR) ImageFormat.JPEG_R else ImageFormat.JPEG
-                // tamaño completo del sensor (el tele llega a 4624x3468, como la cámara stock)
-                val ss = pickSize(map.getOutputSizes(fmt), 4, 3, if (stockMode) 4640 else 4096)!!
+                capsNote = probeCaps(mgr, chars, map)
                 val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), 4, 3, 1440)!!
                 st.setDefaultBufferSize(prev.width, prev.height)
                 val ps = Surface(st)
                 previewSurface = ps
-                val r = ImageReader.newInstance(ss.width, ss.height, fmt, 4)
-                r.setOnImageAvailableListener({ rd -> onStill(rd) }, camHandler)
-                reader = r
                 surfaces += ps
-                surfaces += r.surface
-                jpegRActive = useR
-                if (useR) hlgSurface = r.surface
+                if (stockMode) {
+                    // Foto: ráfaga de cuadros YUV ya procesados por el chip, a resolución completa
+                    val ys = pickSize(map.getOutputSizes(ImageFormat.YUV_420_888), 4, 3, 4096)!!
+                    val r = ImageReader.newInstance(ys.width, ys.height, ImageFormat.YUV_420_888, 3)
+                    r.setOnImageAvailableListener({ rd -> onYuv(rd) }, camHandler)
+                    reader = r
+                    surfaces += r.surface
+                } else {
+                    val ss = pickSize(map.getOutputSizes(ImageFormat.JPEG), 4, 3, 4096)!!
+                    val r = ImageReader.newInstance(ss.width, ss.height, ImageFormat.JPEG, 8)
+                    r.setOnImageAvailableListener({ rd -> onStill(rd) }, camHandler)
+                    reader = r
+                    surfaces += r.surface
+                }
                 if (nightMode && sessKey !in rawBlocked) setupRaw(chars, map)?.let { surfaces += it }
             }
             runOnUiThread { if (!videoMode) rebuildTopBar() }
 
             val outs = surfaces.map { s ->
-                OutputConfiguration(s).also {
-                    if (usePhysical) it.setPhysicalCameraId(lens.physicalId)
-                    if (s === hlgSurface) it.setDynamicRangeProfile(android.hardware.camera2.params.DynamicRangeProfiles.HLG10)
-                }
+                OutputConfiguration(s).also { if (usePhysical) it.setPhysicalCameraId(lens.physicalId) }
             }
             val cfg = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR, outs, executor,
@@ -1207,12 +1208,6 @@ class MainActivity : Activity(), SensorEventListener {
                         updatePreview()
                     }
                     override fun onConfigureFailed(s: CameraCaptureSession) {
-                        if (jpegRActive) {
-                            jpegRBlocked += sessKey
-                            say("Ultra HDR nativo no disponible en este lente: uso el de la app")
-                            camHandler.post { startSession() }
-                            return
-                        }
                         if (rawReader != null) {
                             rawBlocked += sessKey
                             say("Este lente no acepta RAW junto al visor: sigo con JPEG")
@@ -1232,7 +1227,24 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
-    private var hlgSurface: Surface? = null
+    /** Diagnóstico: qué le ofrece el celu a una app de terceros en este lente. */
+    private fun probeCaps(mgr: CameraManager, chars: CameraCharacteristics, map: android.hardware.camera2.params.StreamConfigurationMap): String = try {
+        val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+        val repro = when {
+            caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_YUV_REPROCESSING) -> "sí (YUV)"
+            caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_PRIVATE_REPROCESSING) -> "sí (privado)"
+            else -> "no"
+        }
+        val ext = try {
+            val ec = mgr.getCameraExtensionCharacteristics(camId)
+            val names = mapOf(0 to "auto", 1 to "retoque", 2 to "bokeh", 3 to "HDR", 4 to "noche")
+            ec.supportedExtensions.joinToString(", ") { e ->
+                val jr = if (Build.VERSION.SDK_INT >= 35) ec.getExtensionSupportedSizes(e, ImageFormat.JPEG_R).isNotEmpty() else false
+                (names[e] ?: "$e") + if (jr) " (Ultra HDR)" else ""
+            }.ifEmpty { "ninguna" }
+        } catch (_: Exception) { "ninguna" }
+        "Celu para apps: extensiones $ext · Ultra HDR nativo ${if (supportsJpegR(chars, map)) "sí" else "no"} · reproceso $repro"
+    } catch (e: Exception) { "" }
 
     /** ¿El lente puede entregar Ultra HDR nativo? Necesita salida de 10 bits HLG y el formato JPEG_R. */
     private fun supportsJpegR(chars: CameraCharacteristics, map: android.hardware.camera2.params.StreamConfigurationMap): Boolean = try {
@@ -1385,65 +1397,91 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun onStill(rd: ImageReader) {
         val img = rd.acquireNextImage() ?: return
-        val ts = img.timestamp
         val bytes = try {
             val buf = img.planes[0].buffer
             ByteArray(buf.remaining()).also { buf.get(it) }
         } finally {
             img.close()
         }
-        val st = stockShot
-        if (st != null) { st.offer(bytes, ts); return }
         val m = merger
         if (m != null && m.accepting()) m.offer(bytes)
     }
 
-    // ------------------------------------------------------------------ modo Stock
+    // ------------------------------------------------------------------ modo Foto (ráfaga sobre la imagen del chip)
 
-    /** Brillo máximo de las luces con el nivel elegido: 100 % = ×4 (2 pasos), 150 % = ×8, 50 % = ×2. */
     /** Máximo del Ultra HDR para el nivel elegido: 100 % = ×4.93 como la stock, 50 % = ×2.2, 0 % = sin HDR. */
     private fun stockBoost(): Float = STOCK_UHDR_MAX.pow(prof().hdr / 100f)
 
+    private fun onYuv(rd: ImageReader) {
+        val img = rd.acquireNextImage() ?: return
+        val ts = img.timestamp
+        val frame = try { toYuvFrame(img) } catch (_: Exception) { null } finally { img.close() }
+        val st = stockShot
+        if (st != null && frame != null) st.offer(frame, ts)
+    }
+
+    /** Copia un Image YUV_420_888 (con los pasos de fila y pixel que use el chip) a planos compactos. */
+    private fun toYuvFrame(img: Image): YuvFrame {
+        val w = img.width; val h = img.height
+        val yp = img.planes[0]
+        val y = ByteArray(w * h)
+        val yb = yp.buffer
+        for (r in 0 until h) { yb.position(r * yp.rowStride); yb.get(y, r * w, w) }
+        val cw = (w + 1) / 2; val ch = (h + 1) / 2
+        fun plane(i: Int): ByteArray {
+            val p = img.planes[i]; val b = p.buffer; val ps = p.pixelStride; val rs = p.rowStride
+            val out = ByteArray(cw * ch)
+            val row = ByteArray(rs)
+            for (r in 0 until ch) {
+                b.position(r * rs)
+                val n = minOf(rs, b.remaining())
+                b.get(row, 0, n)
+                for (c in 0 until cw) { val k = c * ps; if (k < n) out[r * cw + c] = row[k] }
+            }
+            return out
+        }
+        return YuvFrame(w, h, y, plane(1), plane(2))
+    }
+
     /**
-     * Foto: una toma procesada por el chip de cámara (exposición, ruido, nitidez y color de Motorola).
-     *  - Con Ultra HDR nativo (JPEG_R) el sistema arma el gain map como la cámara stock; después solo se ajusta
-     *    su intensidad sin tocar la imagen (UltraHdrTuner).
-     *  - Si no, se saca además una toma 3 pasos más oscura para medir las luces y armar el gain map en la app.
+     * Foto: el chip procesa cada cuadro (exposición, color, tono de Motorola) con su reducción de ruido al mínimo
+     * y sin nitidez propia; la app alinea y fusiona $BURST cuadros (como el modo NR de Open Camera / HDR+),
+     * limpia el ruido de color, aplica nitidez según el ruido que quedó y arma el Ultra HDR con una toma
+     * 3 pasos más oscura.
      */
     private fun shootStock() {
         val s = session ?: return say("Cámara no lista")
         val target = reader?.surface ?: return say("Cámara no lista")
-        val boost = stockBoost()
-        val native = jpegRActive
         val t0 = lastT
         val iso0 = lastIso
-        val under = !native && prof().hdr > 0 && t0 > 0L && iso0 > 0
+        if (t0 <= 0L || iso0 <= 0) return say("Esperá un segundo a que el visor mida la exposición")
+        val boost = stockBoost()
+        val withUnder = prof().hdr > 0
         try {
-            val shot = StockShot(if (under) 2 else 1, boost, prof().hdr, native, lens.name)
+            val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val nrModes = mgr.getCameraCharacteristics(camId).get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: intArrayOf()
+            val nr = if (nrModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL)) CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL
+                else CameraMetadata.NOISE_REDUCTION_MODE_FAST
+            // misma exposición en todos los cuadros (lo que midió el visor), con tope para no mover la foto
+            val t = t0.coerceAtMost(66_666_667L)
+            val iso = ((t0.toDouble() * iso0) / t).roundToInt().coerceIn(isoMin, isoMax)
+            val shot = BurstShot(BURST, withUnder, boost, lens.name)
             stockShot = shot
-            val orient = sensorOrientation
-            val normal = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(target)).apply {
-                set(CaptureRequest.JPEG_ORIENTATION, orient)
-                set(CaptureRequest.JPEG_QUALITY, 97.toByte())
-                set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY)
-                set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_HIGH_QUALITY)
-                setTag("sdr")
+            fun req(tt: Long, ii: Int, tag: String) = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(target)).apply {
+                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                set(CaptureRequest.SENSOR_EXPOSURE_TIME, tt)
+                set(CaptureRequest.SENSOR_SENSITIVITY, ii)
+                set(CaptureRequest.SENSOR_FRAME_DURATION, max(tt, 33_333_333L))
+                set(CaptureRequest.NOISE_REDUCTION_MODE, nr)
+                set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_OFF)
+                setTag(tag)
             }.build()
-            val reqs = mutableListOf(normal)
-            if (under) {
-                // -3 EV respecto de lo que mide el visor: primero se acorta el tiempo, después se baja el ISO
-                val total = t0.toDouble() * iso0 / 8.0
-                val t = (total / isoMin).toLong().coerceAtMost(t0).coerceIn(expMin, expMax)
-                val iso = (total / t).roundToInt().coerceIn(isoMin, isoMax)
-                reqs += buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(target)).apply {
-                    set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
-                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, t)
-                    set(CaptureRequest.SENSOR_SENSITIVITY, iso)
-                    set(CaptureRequest.SENSOR_FRAME_DURATION, max(t, 33_333_333L))
-                    set(CaptureRequest.JPEG_ORIENTATION, orient)
-                    set(CaptureRequest.JPEG_QUALITY, 90.toByte())
-                    setTag("under")
-                }.build()
+            val reqs = MutableList(BURST) { req(t, iso, "n") }
+            if (withUnder) {
+                val total = t.toDouble() * iso / 8.0
+                val tu = (total / isoMin).toLong().coerceAtMost(t).coerceIn(expMin, expMax)
+                val iu = (total / tu).roundToInt().coerceIn(isoMin, isoMax)
+                reqs += req(tu, iu, "under")
             }
             s.captureBurst(reqs, object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(ses: CameraCaptureSession, req: CaptureRequest, res: TotalCaptureResult) {
@@ -1453,34 +1491,41 @@ class MainActivity : Activity(), SensorEventListener {
                     shot.onFailed()
                 }
             }, camHandler)
-            camHandler.postDelayed({ if (stockShot === shot) shot.giveUp() }, 8_000L)
-            say(if (under) "Foto + toma para el Ultra HDR..." else "Foto...")
+            camHandler.postDelayed({ if (stockShot === shot) shot.giveUp() }, 10_000L)
+            say("Mantené quieto el celu...")
         } catch (e: Exception) {
             stockShot = null
             say("Foto: ${e.javaClass.simpleName} ${e.message}")
         }
     }
 
-    private inner class StockShot(
-        val expected: Int,
-        val boost: Float,
-        val level: Int,
-        val native: Boolean,
-        val lensName: String
-    ) {
-        /** Imágenes recibidas con su marca de tiempo del sensor (para saber cuál es cuál). */
-        private val frames = java.util.Collections.synchronizedList(mutableListOf<Pair<Long, ByteArray>>())
+    inner class BurstShot(val n: Int, val withUnder: Boolean, val boost: Float, val lensName: String) {
+        private val expected = n + if (withUnder) 1 else 0
         private val tagByTs = java.util.concurrent.ConcurrentHashMap<Long, String>()
         @Volatile private var got = 0
-        @Volatile private var sdrExposure = 0.0
+        @Volatile private var normalExposure = 0.0
         @Volatile private var underExposure = 0.0
-        @Volatile private var sdrInfo = ""
+        @Volatile private var info = ""
         @Volatile private var done = false
+        private var merger: YuvMerger? = null
+        @Volatile private var under: YuvFrame? = null
+        private val started = System.currentTimeMillis()
 
-        fun offer(bytes: ByteArray, ts: Long) {
+        fun offer(f: YuvFrame, ts: Long) {
             if (done) return
-            frames += ts to bytes
-            got++
+            val idx = got++
+            val tag = tagByTs[ts]
+            if (withUnder && (tag == "under" || (tag == null && idx >= n))) {
+                under = f
+            } else {
+                mergeExec.execute {
+                    try {
+                        val m = merger ?: YuvMerger(f.w, f.h).also { merger = it }
+                        m.add(f)
+                    } catch (_: Throwable) {}
+                }
+                say("Foto ${minOf(idx + 1, n)}/$n")
+            }
             if (got >= expected) finish()
         }
 
@@ -1490,7 +1535,7 @@ class MainActivity : Activity(), SensorEventListener {
             val iso = r.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
             val boostRaw = (r.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100) / 100.0
             val e = t.toDouble() * iso * boostRaw
-            if (tag == "under") underExposure = e else { sdrExposure = e; sdrInfo = "${fmtT(t)} · ISO $iso" }
+            if (tag == "under") underExposure = e else if (normalExposure == 0.0) { normalExposure = e; info = "${fmtT(t)} · ISO $iso" }
         }
 
         fun onFailed() {
@@ -1504,83 +1549,63 @@ class MainActivity : Activity(), SensorEventListener {
             if (done) return
             done = true
             mergeExec.execute {
-                val started = System.currentTimeMillis()
-                var sdr: ByteArray? = null
                 try {
-                    // Esperar un poco los metadatos de la toma (suelen llegar junto con la imagen)
+                    val m = merger ?: run { say("No llegaron las fotos"); return@execute }
+                    say("Procesando ${m.frames} fotos...")
                     var waited = 0
-                    while ((sdrExposure == 0.0 || (expected > 1 && underExposure == 0.0)) && waited < 1000) { Thread.sleep(20); waited += 20 }
-                    val list = synchronized(frames) { frames.toList() }
-                    sdr = list.firstOrNull { tagByTs[it.first] == "sdr" }?.second ?: list.firstOrNull()?.second
-                    val under = list.firstOrNull { tagByTs[it.first] == "under" }?.second
-                        ?: list.firstOrNull { it.second !== sdr }?.second
-                    val s = sdr ?: run { say("No llegó la foto"); return@execute }
-                    val name = "IMG_${stamp()}_${lensName}"
-                    var how: String
-                    val out: ByteArray = if (native) {
-                        // Ultra HDR del sistema: solo se ajusta la intensidad, sin tocar la imagen ni el EXIF
-                        val info = UltraHdrTuner.analyze(s)
-                        if (info == null) { how = "JPEG del chip (el sistema no agregó Ultra HDR en esta escena)"; s }
-                        else if (level >= 100) { how = "Ultra HDR nativo ×%.2f, como la stock".format(info.maxBoost); s }
-                        else {
-                            val tb = Math.pow(info.maxBoost, level / 100.0)
-                            how = "Ultra HDR nativo: ×%.2f → ×%.2f (%d %%)".format(info.maxBoost, tb, level)
-                            UltraHdrTuner.setMaxBoost(s, tb) ?: s
-                        }
-                    } else {
-                        val ratio = if (under != null && underExposure > 0.0 && sdrExposure > 0.0) (sdrExposure / underExposure).toFloat() else 0f
-                        val g = if (under != null && ratio > 1f) withGainMap(s, under, ratio) else null
-                        how = when {
-                            g != null -> "Ultra HDR de la app: luces hasta ×%.1f (toma oscura ×%.1f menos luz)".format(boost, ratio)
-                            level == 0 -> "Ultra HDR apagado: JPEG del chip sin tocar"
-                            under != null && ratio > 1f -> "Sin luces que realzar: JPEG del chip sin tocar"
-                            else -> "No se pudo armar el Ultra HDR: JPEG del chip sin tocar"
-                        }
-                        g ?: s
+                    while ((normalExposure == 0.0 || (under != null && underExposure == 0.0)) && waited < 1000) { Thread.sleep(20); waited += 20 }
+                    val merged = m.result()
+                    val w = merged.w; val h = merged.h
+                    val px = yuvToArgb(merged)
+                    val eff = m.effectiveFrames().coerceAtLeast(1f)
+                    // ruido que queda (0..1) para calibrar la limpieza y la nitidez
+                    val sigmaOut = (m.noiseSigma / 255f / kotlin.math.sqrt(eff)).coerceIn(0f, 0.05f)
+                    val stock = StockProfiles.forLens(lensName)
+                    val dp = detailParamsFor(sigmaOut, false, 0, 0, stock.sharpMul, stock.nrMul)
+                    detailEnhance(px, w, h, dp)
+
+                    // Ultra HDR: toma oscura contra la fusionada
+                    val u = under
+                    val ratio = if (u != null && underExposure > 0.0 && normalExposure > 0.0) (normalExposure / underExposure).toFloat() else 0f
+                    var gm: ByteArray? = null
+                    var gw = 0; var gh = 0
+                    if (u != null && ratio > 1f && u.w == w && u.h == h) {
+                        val (sa, sw, sh) = argbSmall(px, w, h, 4)
+                        val (ub, _, _) = yuvToArgbSmall(u, 4)
+                        gm = stockGainMap(sa, ub, sw, sh, ratio, boost)
+                        gw = sw; gh = sh
                     }
-                    val uri = saveImage(out, "$name.jpg")
+                    val out = encodeUltraHdr(px, w, h, gm, gw, gh, boost)
+                    val uri = saveImage(out, "IMG_${stamp()}_$lensName.jpg")
                     if (uri != null) { lastUri = uri; lastMime = "image/jpeg" }
                     setThumb(BitmapFactory.decodeByteArray(out, 0, out.size, BitmapFactory.Options().apply { inSampleSize = 16 }))
                     val secs = (System.currentTimeMillis() - started) / 1000.0
-                    lastShotInfo = "Última: FOTO · $sdrInfo\n$how · %.1f s".format(secs)
+                    lastShotInfo = "Última: FOTO · $info · ${m.frames} cuadros (efectivos %.1f) · desplaz. máx ${m.maxShift} px\n".format(eff) +
+                        "ruido por cuadro %.1f → %.1f · nitidez ×%.2f/×%.2f · ".format(m.noiseSigma, m.noiseSigma / kotlin.math.sqrt(eff), dp.gFine, dp.gMid) +
+                        (if (gm != null) "Ultra HDR ×%.1f".format(boost) else if (withUnder) "sin luces que realzar" else "Ultra HDR apagado") +
+                        " · %.1f s".format(secs)
                     refreshInfo()
                     say("Guardada")
                 } catch (t: Throwable) {
-                    // Ante cualquier problema se guarda la foto del chip tal cual
-                    try { sdr?.let { saveImage(it, "IMG_${stamp()}_${lensName}.jpg") } } catch (_: Throwable) {}
-                    say("Ultra HDR: ${t.javaClass.simpleName} ${t.message}")
+                    say("Foto: ${t.javaClass.simpleName} ${t.message}")
                 } finally {
-                    frames.clear()
-                    if (stockShot === this) stockShot = null
+                    merger = null; under = null
+                    if (stockShot === this@BurstShot) stockShot = null
                 }
             }
         }
+    }
 
-        /** Arma el gain map con las dos tomas y lo adjunta a la foto normal. Devuelve null si no hace falta. */
-        private fun withGainMap(sdrBytes: ByteArray, underBytes: ByteArray, ratio: Float): ByteArray? {
-            val opt = BitmapFactory.Options().apply { inSampleSize = 4 }
-            val a = BitmapFactory.decodeByteArray(sdrBytes, 0, sdrBytes.size, opt) ?: return null
-            val b = BitmapFactory.decodeByteArray(underBytes, 0, underBytes.size, opt) ?: return null
-            if (a.width != b.width || a.height != b.height) { a.recycle(); b.recycle(); return null }
-            val gw = a.width; val gh = a.height
-            val pa = IntArray(gw * gh); val pb = IntArray(gw * gh)
-            a.getPixels(pa, 0, gw, 0, 0, gw, gh); b.getPixels(pb, 0, gw, 0, 0, gw, gh)
-            a.recycle(); b.recycle()
-            val gm = stockGainMap(pa, pb, gw, gh, ratio, boost) ?: return null
-
-            // La orientación que puso el celu en el EXIF (los bitmaps se decodifican sin girar)
-            val exifRot = try {
-                when (android.media.ExifInterface(java.io.ByteArrayInputStream(sdrBytes))
-                    .getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, 1)) {
-                    6 -> 90; 3 -> 180; 8 -> 270; else -> 0
-                }
-            } catch (_: Exception) { 0 }
-            val full = BitmapFactory.decodeByteArray(sdrBytes, 0, sdrBytes.size) ?: return null
-            val img = if (exifRot != 0) {
-                Bitmap.createBitmap(full, 0, 0, full.width, full.height, Matrix().apply { postRotate(exifRot.toFloat()) }, true)
-                    .also { if (it !== full) full.recycle() }
-            } else full
-            val (rb, rw, rh) = rotateBytes(gm, gw, gh, exifRot)
+    /** Gira según el sensor, adjunta el gain map (si hay) y comprime. */
+    private fun encodeUltraHdr(px: IntArray, w: Int, h: Int, gm: ByteArray?, gw: Int, gh: Int, boost: Float): ByteArray {
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(px, 0, w, 0, 0, w, h)
+        val rot = if (w > h) sensorOrientation else 0
+        val img = if (rot != 0) {
+            Bitmap.createBitmap(bmp, 0, 0, w, h, Matrix().apply { postRotate(rot.toFloat()) }, true).also { if (it !== bmp) bmp.recycle() }
+        } else bmp
+        if (gm != null && boost > 1.01f) {
+            val (rb, rw, rh) = rotateBytes(gm, gw, gh, rot)
             val gbmp = Bitmap.createBitmap(rw, rh, Bitmap.Config.ALPHA_8)
             gbmp.copyPixelsFromBuffer(ByteBuffer.wrap(rb))
             val eps = 1f / 64f
@@ -1593,11 +1618,11 @@ class MainActivity : Activity(), SensorEventListener {
             gain.setDisplayRatioForFullHdr(boost)
             gain.setMinDisplayRatioForHdrTransition(1f)
             img.setGainmap(gain)
-            val bos = ByteArrayOutputStream()
-            img.compress(Bitmap.CompressFormat.JPEG, 97, bos)
-            img.recycle()
-            return bos.toByteArray()
         }
+        val bos = ByteArrayOutputStream()
+        img.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+        img.recycle()
+        return bos.toByteArray()
     }
 
     private fun stamp() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -2270,47 +2295,8 @@ private fun lumaCode(bmp: Bitmap): FloatArray {
     }
 }
 
-private fun median(a: FloatArray): Float {
-    val hist = IntArray(256)
-    for (v in a) hist[(v * 255f).toInt().coerceIn(0, 255)]++
-    var c = 0
-    val half = a.size / 2
-    for (i in 0..255) {
-        c += hist[i]
-        if (c >= half) return i / 255f
-    }
-    return 0.5f
-}
 
-private fun mtb(a: FloatArray, th: Float) = ByteArray(a.size) { if (a[it] > th) 1 else 0 }
-private fun mtbMask(a: FloatArray, th: Float) = ByteArray(a.size) { if (abs(a[it] - th) > 0.02f) 1 else 0 }
 
-/** Busca la traslación (dx, dy) que mejor alinea img con ref, con bitmaps de umbral por mediana. */
-private fun estimateShift(refB: ByteArray, refM: ByteArray, imgB: ByteArray, imgM: ByteArray, w: Int, h: Int): IntArray {
-    val range = 10
-    val step = 3
-    var best = Int.MAX_VALUE
-    var bx = 0
-    var by = 0
-    for (dy in -range..range) {
-        for (dx in -range..range) {
-            var err = 0
-            var y = range
-            while (y < h - range) {
-                var x = range
-                while (x < w - range) {
-                    val i = y * w + x
-                    val j = (y + dy) * w + (x + dx)
-                    if (refM[i].toInt() == 1 && imgM[j].toInt() == 1 && refB[i] != imgB[j]) err++
-                    x += step
-                }
-                y += step
-            }
-            if (err < best) { best = err; bx = dx; by = dy }
-        }
-    }
-    return intArrayOf(bx, by)
-}
 
 private fun boxBlur(src: FloatArray, w: Int, h: Int, r: Int): FloatArray {
     val tmp = FloatArray(src.size)
@@ -2367,97 +2353,14 @@ private fun rotateBytes(src: ByteArray, w: Int, h: Int, deg: Int): Triple<ByteAr
 /** Datos fijos del sensor para revelar RAW. cfa: canal (0 R, 1 G, 2 B) de cada posición del bloque 2x2. */
 class RawInfo(val cfa: IntArray, val black: FloatArray, val white: Int)
 
-class TileShifts(val tile: Int, val ntx: Int, val nty: Int, val dx: FloatArray, val dy: FloatArray, val moved: Int)
 
-/** Desplazamiento por bloques de 8x8 pixeles a resolución completa. */
-class ShiftMap(val bw: Int, val dx: IntArray, val dy: IntArray, val maxAbs: Int) {
-    fun idx(x: Int, y: Int) = (y shr 3) * bw + (x shr 3)
-}
 
 private fun reinhard(lin: Float, g: Float): Float {
     val x = lin * g
     return x * (1f + x / (g * g)) / (1f + x)
 }
 
-/**
- * Alineación por zonas: parte del desplazamiento global y busca, en cada zona de 32x32 de la imagen reducida,
- * un ajuste de ±2 pixeles. Solo se acepta si mejora claramente; las zonas sin textura usan el global.
- */
-private fun tileShifts(ref: FloatArray, img: FloatArray, w: Int, h: Int, gdx: Int, gdy: Int): TileShifts {
-    val tile = 32
-    val ntx = (w + tile - 1) / tile
-    val nty = (h + tile - 1) / tile
-    val tdx = FloatArray(ntx * nty) { gdx.toFloat() }
-    val tdy = FloatArray(ntx * nty) { gdy.toFloat() }
-    var moved = 0
-    for (ty in 0 until nty) for (tx in 0 until ntx) {
-        val x0 = tx * tile; val x1 = min(x0 + tile, w)
-        val y0 = ty * tile; val y1 = min(y0 + tile, h)
-        var mean = 0f; var m2 = 0f; var cntT = 0
-        var y = y0
-        while (y < y1) { var x = x0; while (x < x1) { val v = ref[y * w + x]; mean += v; m2 += v * v; cntT++; x += 2 }; y += 2 }
-        if (cntT == 0) continue
-        mean /= cntT
-        if (m2 / cntT - mean * mean < 2e-4f) continue // sin textura: queda el global
-        fun sad(dx: Int, dy: Int): Float {
-            var s = 0f; var c = 0
-            var yy = y0
-            while (yy < y1) {
-                val sy = yy + dy
-                if (sy in 0 until h) {
-                    var xx = x0
-                    while (xx < x1) {
-                        val sx = xx + dx
-                        if (sx in 0 until w) { s += abs(ref[yy * w + xx] - img[sy * w + sx]); c++ }
-                        xx += 2
-                    }
-                }
-                yy += 2
-            }
-            return if (c > cntT / 2) s / c else Float.MAX_VALUE
-        }
-        val base = sad(gdx, gdy)
-        var best = base; var bx = gdx; var by = gdy
-        for (ddy in -2..2) for (ddx in -2..2) {
-            if (ddx == 0 && ddy == 0) continue
-            val v = sad(gdx + ddx, gdy + ddy)
-            if (v < best) { best = v; bx = gdx + ddx; by = gdy + ddy }
-        }
-        if (best < base * 0.97f) {
-            tdx[ty * ntx + tx] = bx.toFloat(); tdy[ty * ntx + tx] = by.toFloat(); moved++
-        }
-    }
-    return TileShifts(tile, ntx, nty, tdx, tdy, moved)
-}
 
-/** Interpola los desplazamientos de las zonas a bloques de 8x8 de la imagen completa. even: múltiplos de 2 (RAW). */
-private fun buildShiftMap(t: TileShifts, fw: Int, fh: Int, scale: Int, even: Boolean): ShiftMap {
-    val bw = (fw + 7) / 8
-    val bh = (fh + 7) / 8
-    val dx = IntArray(bw * bh)
-    val dy = IntArray(bw * bh)
-    var mx = 0
-    for (by in 0 until bh) for (bx in 0 until bw) {
-        val cx = (bx * 8 + 4f) / scale / t.tile - 0.5f
-        val cy = (by * 8 + 4f) / scale / t.tile - 0.5f
-        val txc = cx.coerceIn(0f, (t.ntx - 1).toFloat())
-        val tyc = cy.coerceIn(0f, (t.nty - 1).toFloat())
-        val x0 = txc.toInt(); val x1 = min(x0 + 1, t.ntx - 1)
-        val y0 = tyc.toInt(); val y1 = min(y0 + 1, t.nty - 1)
-        val fx = txc - x0; val fy = tyc - y0
-        fun lerp(a: FloatArray): Float {
-            val top = a[y0 * t.ntx + x0] * (1 - fx) + a[y0 * t.ntx + x1] * fx
-            val bot = a[y1 * t.ntx + x0] * (1 - fx) + a[y1 * t.ntx + x1] * fx
-            return (top * (1 - fy) + bot * fy) * scale
-        }
-        val vx = lerp(t.dx); val vy = lerp(t.dy)
-        val ix = if (even) (vx / 2f).roundToInt() * 2 else vx.roundToInt()
-        val iy = if (even) (vy / 2f).roundToInt() * 2 else vy.roundToInt()
-        dx[by * bw + bx] = ix; dy[by * bw + bx] = iy
-        mx = max(mx, max(abs(ix), abs(iy)))
-    }
-    return ShiftMap(bw, dx, dy, mx)
-}
 
 /** Gain map: relación entre la escena real (lineal * G) y la versión SDR con tono, en escala log2 normalizada. */
 private fun gainBytes(cell: FloatArray, gw: Int, gh: Int, g: Float, tone: (Float) -> Float): ByteArray {
