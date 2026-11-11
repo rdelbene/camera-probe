@@ -53,6 +53,7 @@ class HdrTunerActivity : Activity() {
     private var pendingReplace: List<Uri> = emptyList()
 
     private lateinit var levelLabel: TextView
+    private lateinit var autoBtn: TextView
     private lateinit var status: TextView
     private lateinit var grid: GridView
     private lateinit var btnReplace: TextView
@@ -132,10 +133,16 @@ class HdrTunerActivity : Activity() {
                 override fun onStartTrackingTouch(s: SeekBar) {}
                 override fun onStopTrackingTouch(s: SeekBar) {
                     getSharedPreferences("cfg", Context.MODE_PRIVATE).edit().putFloat("tuneBoost", target.toFloat()).apply()
+                    if (::autoBtn.isInitialized) updateAuto()
                 }
             })
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         updateLevel()
+
+        // automático: el nivel elegido se aplica solo a cada foto nueva de la cámara
+        autoBtn = pillButton("", Color.argb(255, 50, 50, 50), Color.WHITE) { toggleAuto() }
+        root.addView(autoBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+        updateAuto()
 
         status = TextView(this).apply {
             textSize = 13f
@@ -167,6 +174,42 @@ class HdrTunerActivity : Activity() {
         root.addView(row)
         setContentView(root)
         updateButtons()
+    }
+
+    private fun toggleAuto() {
+        if (AutoHdr.isOn(this)) { AutoHdr.setOn(this, false); updateAuto(); return }
+        if (!AutoHdr.canWrite()) {
+            status.text = "Activá \"Permitir acceso para administrar todos los archivos\" para UHDR Cam y volvé."
+            wantAuto = true
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+            } catch (e: Exception) {
+                startActivity(Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            }
+            return
+        }
+        getSharedPreferences("cfg", Context.MODE_PRIVATE).edit().putFloat("tuneBoost", target.toFloat()).apply()
+        AutoHdr.setOn(this, true)
+        updateAuto()
+        status.text = "Listo: cada foto nueva de la cámara se ajusta sola a ×%.2f.".format(target)
+    }
+
+    private var wantAuto = false
+
+    override fun onResume() {
+        super.onResume()
+        if (wantAuto && AutoHdr.canWrite()) { wantAuto = false; toggleAuto() }
+        if (::autoBtn.isInitialized) updateAuto()
+        AutoHdr.ensure(this)
+    }
+
+    private fun updateAuto() {
+        val on = AutoHdr.isOn(this) && AutoHdr.canWrite()
+        val n = getSharedPreferences("cfg", Context.MODE_PRIVATE).getInt("autoCount", 0)
+        autoBtn.text = if (on) "Automático: PRENDIDO · fotos nuevas a ×%.2f (%d ajustadas)".format(AutoHdr.level(this), n)
+            else "Automático: apagado · tocá para aplicar este nivel a cada foto nueva"
+        (autoBtn.background as GradientDrawable).setColor(if (on) Color.rgb(0, 224, 150) else Color.argb(255, 50, 50, 50))
+        autoBtn.setTextColor(if (on) Color.BLACK else Color.WHITE)
     }
 
     private fun updateLevel() {

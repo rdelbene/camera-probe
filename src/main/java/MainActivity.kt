@@ -290,6 +290,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AutoHdr.ensure(this)
         prefs = getSharedPreferences("cfg", Context.MODE_PRIVATE)
         Lens.values().forEach { l ->
             profiles[l] = Profile(
