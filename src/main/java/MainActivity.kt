@@ -29,12 +29,18 @@ import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
+import android.media.MediaCodec
+import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
+import android.util.Range
+import android.util.Size
 import android.view.GestureDetector
 import android.view.MotionEvent
-import android.provider.MediaStore
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
@@ -49,11 +55,14 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileDescriptor
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
@@ -61,23 +70,28 @@ import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
-/** Lentes de tu Edge 50 Ultra segun el diagnostico: fisicos 3 (UGA), 2 (principal), 5 (tele). */
-enum class Lens(val label: String, val zoom: Float, val physicalId: String) {
-    UGA("0.5x UGA", 0.5f, "3"),
-    MAIN("1x Principal", 1.0f, "2"),
-    TELE("3x Tele", 3.0f, "5")
+/** Lentes del Edge 50 Ultra: fisicos 3 (UGA), 2 (principal), 5 (tele) dentro de la logica 0, y la frontal. */
+enum class Lens(val label: String, val zoom: Float, val physicalId: String, val front: Boolean = false) {
+    UGA("0.5x", 0.5f, "3"),
+    MAIN("1x", 1.0f, "2"),
+    TELE("3x", 3.0f, "5"),
+    FRONT("Frontal", 1.0f, "", true)
 }
 
 /**
  * Ajustes por lente. exp en pasos de 1/6 EV (-36..36).
- * nr/edge: 0=Auto (no se toca, queda el criterio del fabricante) 1=off 2=rapido 3=alta.
- * hdr: intensidad del Ultra HDR en %.
+ * nr/edge: 0=Auto (criterio del fabricante) 1=off 2=rapido 3=alta.
+ * hdr: intensidad del gain map Ultra HDR en %.
  */
 class Profile(var exp: Int = 0, var nr: Int = 0, var edge: Int = 0, var hdr: Int = 100)
 
 class MainActivity : Activity() {
 
+    // ------------------------------------------------------------------ interfaz
     private lateinit var texture: TextureView
+    private lateinit var previewFrame: FrameLayout
+    private lateinit var focusRing: View
+    private lateinit var shutter: Button
     private lateinit var status: TextView
     private lateinit var expBar: SeekBar
     private lateinit var expLabel: TextView
@@ -85,70 +99,88 @@ class MainActivity : Activity() {
     private lateinit var edgeGroup: RadioGroup
     private lateinit var hdrBar: SeekBar
     private lateinit var hdrLabel: TextView
+    private lateinit var hlLabel: TextView
+    private lateinit var photoBox: LinearLayout
+    private lateinit var videoBox: LinearLayout
+    private lateinit var nightBox: LinearLayout
     private lateinit var prefs: SharedPreferences
+    private var suppress = false
 
+    // ------------------------------------------------------------------ modos
     private var lens = Lens.MAIN
+    private var videoMode = false
     private var physicalMode = false
-    private var burstN = 3
-    /** 0 = desactivado (JPEG común), 1 = activo (Ultra HDR del fabricante), 2 = mejorado (fusión por ráfaga) */
+    /** Procesamiento HDR: 0 desactivado (1 foto), 1 activo (fusión de 8), 2 mejorado (fusión de 15). */
     private var hdrMode = 1
-    private val fusionMode get() = hdrMode == 2
-    private var pendingMode = 1
-    private lateinit var photoBtn: Button
+    /** Formato de archivo Ultra HDR (JPEG con gain map). Independiente del procesamiento. */
+    private var ultraHdr = true
+    private var nightMode = false
+    private var nightFrames = 15
+    /** Protección de luces altas en pasos de 1/3 EV (0..9). */
+    private var hlSteps = 3
+    private var v4k = false
+    private var v60 = false
 
-    // Foco por toque
-    private lateinit var focusRing: View
-    @Volatile private var focusRegion: MeteringRectangle? = null
-    @Volatile private var afWatching = false
-    private var activeArray: Rect? = null
-    private var maxAfRegions = 0
-    private var maxAeRegions = 0
     private var vMfnr = false
-    private var vMfhdr = false
     private var vShdr = false
     private var vZsl = false
     private var vMoto = false
     private var vendorKeys: Set<String> = emptySet()
     private var vendorLog = ""
-    private var suppress = false
+    private var sessionNote = ""
+    private val profiles = mutableMapOf<Lens, Profile>()
+
+    private val camThread = HandlerThread("cam").apply { start() }
+    private val camHandler by lazy { Handler(camThread.looper) }
+    private val executor = Executor { camHandler.post(it) }
+    private val mergeExec = Executors.newSingleThreadExecutor()
+
+    // ------------------------------------------------------------------ cámara
+    private var camId = "0"
+    private var frontId: String? = null
+    private var device: CameraDevice? = null
+    private var session: CameraCaptureSession? = null
+    private var reader: ImageReader? = null
+    private var previewSurface: Surface? = null
+    private var stillIsUltra = false
+    private var sensorOrientation = 90
+
+    private var expMin = 1_000L
+    private var expMax = 1_000_000_000L
+    private var isoMin = 50
+    private var isoMax = 3200
+
+    @Volatile private var lastT = 0L
+    @Volatile private var lastIso = 0
+
+    // Video
+    private var recSurface: Surface? = null
+    private var recorder: MediaRecorder? = null
+    private var recPfd: ParcelFileDescriptor? = null
+    private var recUri: Uri? = null
+    @Volatile private var recording = false
+    private var videoSize = Size(1920, 1080)
+    private var videoFps = 30
+    private var fpsRange = Range(30, 30)
+
+    // Foco por toque
+    @Volatile private var focusRegion: MeteringRectangle? = null
+    @Volatile private var afWatching = false
+    private var activeArray: Rect? = null
+    private var maxAfRegions = 0
+    private var maxAeRegions = 0
 
     // Opción experimental recién activada: si la cámara se cae antes de estabilizarse, se revierte
     private var riskySwitch: Switch? = null
     private var riskyName = ""
     private var riskyRevert: (() -> Unit)? = null
     @Volatile private var okFrames = 0
-    private val profiles = mutableMapOf<Lens, Profile>()
 
-    private val camThread = HandlerThread("cam").apply { start() }
-    private val camHandler by lazy { Handler(camThread.looper) }
-    private val executor = Executor { camHandler.post(it) }
-
-    private var device: CameraDevice? = null
-    private var session: CameraCaptureSession? = null
-    private var reader: ImageReader? = null
-    private var previewSurface: Surface? = null
-    private var sensorOrientation = 90
-
-    // Capacidades del lente activo
-    private var expMin = 1_000L
-    private var expMax = 1_000_000_000L
-    private var isoMin = 50
-    private var isoMax = 3200
-
-    // Ultima exposicion medida por el visor (para armar la ráfaga)
-    @Volatile private var lastT = 0L
-    @Volatile private var lastIso = 0
-
+    // Captura en curso
     private var pendingLens = Lens.MAIN
     private var pendingHdr = 100
-
-    // Estado de la fusión
-    private val fuseLock = Any()
-    private val fuseImgs = arrayOfNulls<ByteArray>(5)
-    private val fuseP = DoubleArray(5)
-    private var fuseTotal = 3
-    private var fuseImgCount = 0
-    private var fuseResCount = 0
+    private var pendingUltra = false
+    @Volatile private var merger: Merger? = null
 
     // ------------------------------------------------------------------ ciclo de vida
 
@@ -164,6 +196,19 @@ class MainActivity : Activity() {
             )
         }
         hdrMode = prefs.getInt("hdrMode", 1).coerceIn(0, 2)
+        ultraHdr = prefs.getBoolean("ultraHdr", true)
+        nightFrames = prefs.getInt("nightFrames", 15).let { if (it in listOf(10, 15, 20)) it else 15 }
+        hlSteps = prefs.getInt("hlSteps", 3).coerceIn(0, 9)
+        v4k = prefs.getBoolean("v4k", false)
+        v60 = prefs.getBoolean("v60", false)
+
+        val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        frontId = try {
+            mgr.cameraIdList.firstOrNull {
+                mgr.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_FRONT
+            }
+        } catch (_: Exception) { null }
+
         buildUi()
     }
 
@@ -177,9 +222,16 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    override fun onDestroy() {
+        try { recSurface?.release() } catch (_: Exception) {}
+        mergeExec.shutdown()
+        camThread.quitSafely()
+        super.onDestroy()
+    }
+
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
-        if (results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED) openCamera()
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) openCamera()
         else say("Sin permiso de cámara")
     }
 
@@ -193,6 +245,8 @@ class MainActivity : Activity() {
             e.putInt("${l.name}_exp", p.exp).putInt("${l.name}_nr2", p.nr)
                 .putInt("${l.name}_edge2", p.edge).putInt("${l.name}_hdr2", p.hdr)
         }
+        e.putInt("hdrMode", hdrMode).putBoolean("ultraHdr", ultraHdr).putInt("nightFrames", nightFrames)
+            .putInt("hlSteps", hlSteps).putBoolean("v4k", v4k).putBoolean("v60", v60)
         e.apply()
     }
 
@@ -202,8 +256,8 @@ class MainActivity : Activity() {
         setPadding(24, 20, 24, 4)
     }
 
-    private fun seek(max: Int, onChange: (Int) -> Unit) = SeekBar(this).apply {
-        this.max = max
+    private fun seek(maxValue: Int, onChange: (Int) -> Unit) = SeekBar(this).apply {
+        max = maxValue
         setPadding(48, 8, 48, 8)
         setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
@@ -214,22 +268,35 @@ class MainActivity : Activity() {
         })
     }
 
-    private fun modeGroup(onPick: (Int) -> Unit) = RadioGroup(this).apply {
+    private fun radioRow(options: List<String>, selected: Int, onPick: (Int) -> Unit) = RadioGroup(this).apply {
         orientation = RadioGroup.HORIZONTAL
         setPadding(24, 0, 24, 0)
-        listOf("Auto", "Off", "Rápido", "Alta").forEachIndexed { i, t ->
+        options.forEachIndexed { i, t ->
             addView(RadioButton(context).apply {
                 id = View.generateViewId()
                 text = t
                 tag = i
             })
         }
+        if (selected in options.indices) (getChildAt(selected) as RadioButton).isChecked = true
         setOnCheckedChangeListener { g, id ->
             if (!suppress) {
                 val b = g.findViewById<RadioButton>(id)
                 if (b != null) onPick(b.tag as Int)
             }
         }
+    }
+
+    private fun switchRow(t: String, checked: Boolean, onSet: (Boolean) -> Unit) = Switch(this).apply {
+        text = t
+        isChecked = checked
+        setPadding(24, 12, 24, 8)
+        setOnCheckedChangeListener { _, c -> if (!suppress) onSet(c) }
+    }
+
+    private fun previewHeight(): Int {
+        val w = resources.displayMetrics.widthPixels
+        return if (videoMode) w * 16 / 9 else w * 4 / 3
     }
 
     private fun buildUi() {
@@ -239,9 +306,10 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, 64)
         }
 
+        // Visor + anillo de foco
         texture = TextureView(this)
-        val frame = FrameLayout(this)
-        frame.addView(texture, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        previewFrame = FrameLayout(this)
+        previewFrame.addView(texture, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         val ringPx = (resources.displayMetrics.density * 64).toInt()
         focusRing = View(this).apply {
             background = GradientDrawable().apply {
@@ -250,8 +318,14 @@ class MainActivity : Activity() {
             }
             visibility = View.INVISIBLE
         }
-        frame.addView(focusRing, FrameLayout.LayoutParams(ringPx, ringPx))
-        root.addView(frame, LinearLayout.LayoutParams(w, w * 4 / 3))
+        previewFrame.addView(focusRing, FrameLayout.LayoutParams(ringPx, ringPx))
+        root.addView(previewFrame, LinearLayout.LayoutParams(w, previewHeight()))
+        texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) { openCamera() }
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+        }
         val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent) = true
             override fun onSingleTapUp(e: MotionEvent): Boolean {
@@ -260,70 +334,95 @@ class MainActivity : Activity() {
             override fun onLongPress(e: MotionEvent) { resetFocus(true) }
         })
         texture.setOnTouchListener { _, e -> gestures.onTouchEvent(e) }
-        texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) { openCamera() }
-            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
-            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
-            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
-        }
 
-        photoBtn = Button(this).apply {
+        shutter = Button(this).apply {
             textSize = 18f
-            setOnClickListener { takePhoto() }
+            setOnClickListener { onShutter() }
         }
-        root.addView(photoBtn)
-        updatePhotoButton()
+        root.addView(shutter)
 
         status = TextView(this).apply { textSize = 12f; setPadding(24, 8, 24, 8) }
         root.addView(status)
 
-        // Selector de lente
-        root.addView(label("Lente"))
-        val lensGroup = RadioGroup(this).apply {
-            orientation = RadioGroup.HORIZONTAL
-            setPadding(24, 0, 24, 0)
-        }
-        Lens.values().forEach { l ->
-            lensGroup.addView(RadioButton(this).apply {
-                id = View.generateViewId()
-                text = l.label
-                tag = l
-            })
-        }
-        (lensGroup.getChildAt(Lens.MAIN.ordinal) as RadioButton).isChecked = true
-        lensGroup.setOnCheckedChangeListener { g, id ->
-            val b = g.findViewById<RadioButton>(id)
-            if (b != null) selectLens(b.tag as Lens)
-        }
-        root.addView(lensGroup)
+        root.addView(label("Modo"))
+        root.addView(radioRow(listOf("Foto", "Video"), 0) { setVideoMode(it == 1) })
 
-        // Modos de captura
-        root.addView(label("HDR"))
-        val hdrGroup = RadioGroup(this).apply {
-            orientation = RadioGroup.HORIZONTAL
-            setPadding(24, 0, 24, 0)
-        }
-        listOf("Desactivado", "Activo", "Mejorado").forEachIndexed { i, t ->
-            hdrGroup.addView(RadioButton(this).apply {
-                id = View.generateViewId()
-                text = t
-                tag = i
+        root.addView(label("Lente"))
+        root.addView(radioRow(Lens.values().map { it.label }, lens.ordinal) { selectLens(Lens.values()[it]) })
+
+        // ---------------- foto
+        photoBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        photoBox.addView(label("HDR (procesamiento)"))
+        photoBox.addView(radioRow(listOf("Desactivado", "Activo", "Mejorado"), hdrMode) {
+            hdrMode = it; save(); afterPhotoModeChange()
+        })
+        photoBox.addView(switchRow("Ultra HDR (archivo con gain map para pantallas HDR)", ultraHdr) {
+            ultraHdr = it; save(); afterPhotoModeChange()
+        })
+        photoBox.addView(switchRow("Modo noche", nightMode) {
+            nightMode = it
+            nightBox.visibility = if (it) View.VISIBLE else View.GONE
+            afterPhotoModeChange()
+        })
+        nightBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            addView(label("Fotos por toma nocturna"))
+            val opts = listOf(10, 15, 20)
+            addView(radioRow(opts.map { "$it" }, opts.indexOf(nightFrames)) {
+                nightFrames = opts[it]; save(); updateShutter()
             })
         }
-        (hdrGroup.getChildAt(hdrMode) as RadioButton).isChecked = true
-        hdrGroup.setOnCheckedChangeListener { g, id ->
-            val b = g.findViewById<RadioButton>(id) ?: return@setOnCheckedChangeListener
-            hdrMode = b.tag as Int
-            prefs.edit().putInt("hdrMode", hdrMode).apply()
-            updatePhotoButton()
-            if (device != null) startSession()
+        photoBox.addView(nightBox)
+        hlLabel = label(hlText())
+        photoBox.addView(hlLabel)
+        photoBox.addView(seek(9) { p ->
+            hlSteps = p; save(); hlLabel.text = hlText()
+        }.apply { progress = hlSteps })
+        hdrLabel = label("")
+        photoBox.addView(hdrLabel)
+        hdrBar = seek(150) { p ->
+            prof().hdr = p
+            hdrLabel.text = "Intensidad Ultra HDR: $p%"
+            save()
         }
-        root.addView(hdrGroup)
-        root.addView(Switch(this).apply {
-            text = "Mejorado: ráfaga de 5 fotos (más suave, tarda más)"
-            setPadding(24, 8, 24, 8)
-            setOnCheckedChangeListener { _, checked -> burstN = if (checked) 5 else 3 }
-        })
+        photoBox.addView(hdrBar)
+        root.addView(photoBox)
+
+        // ---------------- video
+        videoBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            addView(label("Resolución"))
+            addView(radioRow(listOf("FHD 1080p", "4K"), if (v4k) 1 else 0) {
+                v4k = it == 1; save(); updateShutter(); restartVideo()
+            })
+            addView(label("Cuadros por segundo"))
+            addView(radioRow(listOf("30 fps", "60 fps"), if (v60) 1 else 0) {
+                v60 = it == 1; save(); updateShutter(); restartVideo()
+            })
+        }
+        root.addView(videoBox)
+
+        // ---------------- ajustes por lente
+        expLabel = label("")
+        root.addView(expLabel)
+        expBar = seek(72) { p ->
+            prof().exp = p - 36
+            expLabel.text = "Exposición: %+.1f EV".format(prof().exp / 6f)
+            save(); updatePreview()
+        }
+        root.addView(expBar)
+
+        root.addView(label("Reducción de ruido"))
+        nrGroup = radioRow(listOf("Auto", "Off", "Rápido", "Alta"), -1) { prof().nr = it; save(); updatePreview() }
+        root.addView(nrGroup)
+
+        root.addView(label("Nitidez (edge)"))
+        edgeGroup = radioRow(listOf("Auto", "Off", "Rápido", "Alta"), -1) { prof().edge = it; save(); updatePreview() }
+        root.addView(edgeGroup)
+
+        // ---------------- experimental
         root.addView(label("Motor propio Qualcomm / Motorola (experimental)"))
         fun vendorSwitch(t: String, onSet: (Boolean) -> Unit) = root.addView(Switch(this).apply {
             text = t
@@ -341,51 +440,24 @@ class MainActivity : Activity() {
             }
         })
         vendorSwitch("MFNR: ruido multi-frame") { vMfnr = it }
-        vendorSwitch("MFHDR: HDR multi-frame") { vMfhdr = it }
         vendorSwitch("SHDR: HDR escalonado") { vShdr = it }
         vendorSwitch("ZSL de Motorola") { vZsl = it }
         vendorSwitch("Marcar cliente como Moto Camera") { vMoto = it }
 
-        root.addView(Switch(this).apply {
-            text = "Lente físico directo (experimental)"
-            setPadding(24, 8, 24, 8)
-            setOnCheckedChangeListener { _, checked ->
-                physicalMode = checked
-                if (device != null) startSession()
-            }
+        root.addView(switchRow("Lente físico directo (experimental)", false) {
+            physicalMode = it
+            if (device != null) startSession()
         })
-
-        // Exposicion
-        expLabel = label("")
-        root.addView(expLabel)
-        expBar = seek(72) { p ->
-            prof().exp = p - 36
-            expLabel.text = "Exposición: %+.1f EV".format(prof().exp / 6f)
-            save(); updatePreview()
-        }
-        root.addView(expBar)
-
-        // Reduccion de ruido y nitidez
-        root.addView(label("Reducción de ruido"))
-        nrGroup = modeGroup { prof().nr = it; save(); updatePreview() }
-        root.addView(nrGroup)
-
-        root.addView(label("Nitidez (edge)"))
-        edgeGroup = modeGroup { prof().edge = it; save(); updatePreview() }
-        root.addView(edgeGroup)
-
-        // Intensidad del gain map
-        hdrLabel = label("")
-        root.addView(hdrLabel)
-        hdrBar = seek(150) { p ->
-            prof().hdr = p
-            hdrLabel.text = "Intensidad Ultra HDR: $p%"
-            save()
-        }
-        root.addView(hdrBar)
 
         setContentView(ScrollView(this).apply { addView(root) })
         refreshControls()
+        updateShutter()
+    }
+
+    private fun hlText(): String {
+        val ev = hlSteps / 3f
+        return "Protección de luces altas: %.1f EV".format(ev) +
+            if (hlSteps == 0) "  (sin margen: no se genera Ultra HDR en Activo/Mejorado/Noche)" else ""
     }
 
     private fun refreshControls() {
@@ -400,23 +472,67 @@ class MainActivity : Activity() {
         suppress = false
     }
 
+    private fun updateShutter() {
+        shutter.text = when {
+            videoMode && recording -> "■  DETENER"
+            videoMode -> "●  GRABAR  (${if (v4k) "4K" else "FHD"} ${if (v60) 60 else 30} fps)"
+            nightMode -> "FOTO  (noche, $nightFrames fotos" + (if (ultraHdr) " + Ultra HDR)" else ")")
+            else -> "FOTO  (HDR " + arrayOf("desactivado", "activo", "mejorado")[hdrMode] +
+                (if (ultraHdr) " + Ultra HDR)" else ")")
+        }
+    }
+
+    private fun afterPhotoModeChange() {
+        updateShutter()
+        if (device != null) startSession()
+    }
+
+    private fun restartVideo() {
+        if (videoMode && !recording && device != null) startSession()
+    }
+
+    private fun setVideoMode(v: Boolean) {
+        if (recording) camHandler.post { stopRecording() }
+        videoMode = v
+        photoBox.visibility = if (v) View.GONE else View.VISIBLE
+        videoBox.visibility = if (v) View.VISIBLE else View.GONE
+        previewFrame.layoutParams = LinearLayout.LayoutParams(resources.displayMetrics.widthPixels, previewHeight())
+        updateShutter()
+        if (device != null) camHandler.post { startSession() }
+    }
+
+    private fun cameraIdFor(l: Lens) = if (l.front) (frontId ?: "1") else "0"
+    private val usePhysical get() = physicalMode && !lens.front
+
     private fun selectLens(l: Lens) {
+        if (recording) camHandler.post { stopRecording() }
+        val newId = cameraIdFor(l)
         lens = l
         focusRegion = null
         afWatching = false
         focusRing.visibility = View.INVISIBLE
         refreshControls()
-        if (physicalMode) startSession() else updatePreview()
+        if (newId != camId) {
+            closeCamera()
+            openCamera()
+        } else if (usePhysical) startSession() else updatePreview()
     }
 
     private fun say(msg: String) = runOnUiThread { status.text = msg }
 
-    private fun updatePhotoButton() {
-        photoBtn.text = when (hdrMode) {
-            0 -> "FOTO  (HDR desactivado)"
-            1 -> "FOTO  (HDR activo)"
-            else -> "FOTO  (HDR mejorado)"
+    private fun statusLine(): String {
+        val where = when {
+            lens.front -> "frontal"
+            usePhysical -> "físico ${lens.physicalId}"
+            else -> "lógico"
         }
+        val what = when {
+            videoMode && recording -> "● GRABANDO ${videoSize.height}p $videoFps fps"
+            videoMode -> "video ${videoSize.height}p $videoFps fps"
+            nightMode -> "noche $nightFrames fotos"
+            else -> "HDR " + arrayOf("desactivado", "activo", "mejorado")[hdrMode]
+        }
+        return "${lens.label} · $where · $what$sessionNote$vendorLog"
     }
 
     // ------------------------------------------------------------------ foco por toque
@@ -425,9 +541,9 @@ class MainActivity : Activity() {
         val arr = activeArray ?: return
         if (session == null || vw <= 0 || vh <= 0) return
         if (maxAfRegions <= 0 && maxAeRegions <= 0) { say("Este lente no admite foco por toque"); return }
-        val nx = (x / vw).coerceIn(0f, 1f)
+        var nx = (x / vw).coerceIn(0f, 1f)
         val ny = (y / vh).coerceIn(0f, 1f)
-        // Pantalla vertical -> coordenadas del sensor (apaisado)
+        if (lens.front) nx = 1f - nx // el visor de la frontal está espejado
         val (sx, sy) = when (sensorOrientation) {
             90 -> ny to 1f - nx
             180 -> 1f - nx to 1f - ny
@@ -441,9 +557,9 @@ class MainActivity : Activity() {
         val t = ((sy * ah).toInt() - size / 2).coerceIn(0, ah - size)
         focusRegion = MeteringRectangle(l, t, size, size, MeteringRectangle.METERING_WEIGHT_MAX)
 
+        focusRing.animate().cancel()
         focusRing.translationX = x - focusRing.width / 2f
         focusRing.translationY = y - focusRing.height / 2f
-        focusRing.animate().cancel()
         setRingColor(Color.WHITE)
         focusRing.alpha = 1f
         focusRing.visibility = View.VISIBLE
@@ -454,15 +570,20 @@ class MainActivity : Activity() {
         (focusRing.background as GradientDrawable).setStroke((resources.displayMetrics.density * 2).toInt(), c)
     }
 
+    private fun repeatingTargets(): List<Surface> =
+        listOfNotNull(previewSurface, if (recording) recSurface else null)
+
+    private fun repeatingTemplate() = if (videoMode) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+
     private fun triggerAf() {
         val s = session ?: return
-        val surf = previewSurface ?: return
+        if (previewSurface == null) return
         try {
-            val cancel = buildRequest(CameraDevice.TEMPLATE_PREVIEW, surf, true)
+            val cancel = buildRequest(repeatingTemplate(), repeatingTargets())
             cancel.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
             s.capture(cancel.build(), null, camHandler)
             updatePreview()
-            val start = buildRequest(CameraDevice.TEMPLATE_PREVIEW, surf, true)
+            val start = buildRequest(repeatingTemplate(), repeatingTargets())
             start.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
             afWatching = true
             s.capture(start.build(), previewCb, camHandler)
@@ -472,7 +593,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Vuelve al enfoque continuo automático. */
     private fun resetFocus(announce: Boolean) {
         val had = focusRegion != null
         focusRegion = null
@@ -481,10 +601,9 @@ class MainActivity : Activity() {
         if (!had) return
         camHandler.post {
             val s = session
-            val surf = previewSurface
-            if (s != null && surf != null) {
+            if (s != null && previewSurface != null) {
                 try {
-                    val cancel = buildRequest(CameraDevice.TEMPLATE_PREVIEW, surf, true)
+                    val cancel = buildRequest(repeatingTemplate(), repeatingTargets())
                     cancel.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
                     s.capture(cancel.build(), null, camHandler)
                 } catch (_: Exception) {}
@@ -499,19 +618,25 @@ class MainActivity : Activity() {
     @SuppressLint("MissingPermission")
     private fun openCamera() {
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
+            requestPermissions(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO), 1)
             return
         }
         if (!texture.isAvailable || device != null) return
         try {
             val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            sensorOrientation = mgr.getCameraCharacteristics("0")
+            camId = cameraIdFor(lens)
+            sensorOrientation = mgr.getCameraCharacteristics(camId)
                 .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-            mgr.openCamera("0", object : CameraDevice.StateCallback() {
+            mgr.openCamera(camId, object : CameraDevice.StateCallback() {
                 override fun onOpened(d: CameraDevice) { device = d; startSession() }
-                override fun onDisconnected(d: CameraDevice) { d.close(); device = null }
+                override fun onDisconnected(d: CameraDevice) {
+                    d.close()
+                    if (device === d) { device = null; session = null }
+                }
                 override fun onError(d: CameraDevice, error: Int) {
-                    d.close(); device = null; session = null
+                    d.close()
+                    if (device !== d) return
+                    device = null; session = null
                     val sw = riskySwitch
                     if (sw != null) {
                         riskyRevert?.invoke()
@@ -533,6 +658,7 @@ class MainActivity : Activity() {
     }
 
     private fun closeCamera() {
+        if (recording) stopRecording()
         try { session?.close() } catch (_: Exception) {}
         session = null
         try { device?.close() } catch (_: Exception) {}
@@ -541,15 +667,26 @@ class MainActivity : Activity() {
         reader = null
     }
 
+    private fun pickSize(sizes: Array<Size>?, aspectW: Int, aspectH: Int, maxW: Int): Size? {
+        if (sizes.isNullOrEmpty()) return null
+        return sizes.filter { it.width * aspectH == it.height * aspectW && it.width <= maxW }
+            .maxByOrNull { it.width * it.height }
+            ?: sizes.maxByOrNull { it.width * it.height }
+    }
+
     private fun startSession() {
         val d = device ?: return
         try {
-            session?.close(); session = null
-            reader?.close(); reader = null
-            synchronized(fuseLock) { fuseImgCount = 0; fuseResCount = 0 }
+            try { session?.close() } catch (_: Exception) {}
+            session = null
+            try { reader?.close() } catch (_: Exception) {}
+            reader = null
+            try { recSurface?.release() } catch (_: Exception) {}
+            recSurface = null
+            sessionNote = ""
 
             val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val chars = mgr.getCameraCharacteristics(if (physicalMode) lens.physicalId else "0")
+            val chars = mgr.getCameraCharacteristics(if (usePhysical) lens.physicalId else camId)
             val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
 
             vendorKeys = chars.availableCaptureRequestKeys.map { it.name }.toSet()
@@ -562,27 +699,59 @@ class MainActivity : Activity() {
             afWatching = false
             runOnUiThread { focusRing.visibility = View.INVISIBLE }
 
-            val stillFormat = if (hdrMode == 1) ImageFormat.JPEG_R else ImageFormat.JPEG
-            val stillSize = map.getOutputSizes(stillFormat)
-                .filter { it.width * 3 == it.height * 4 && it.width <= 4096 }
-                .maxByOrNull { it.width * it.height }!!
-            val prevSize = map.getOutputSizes(SurfaceTexture::class.java)
-                .filter { it.width * 3 == it.height * 4 && it.width <= 1440 }
-                .maxByOrNull { it.width * it.height }!!
-
             val st = texture.surfaceTexture!!
-            st.setDefaultBufferSize(prevSize.width, prevSize.height)
-            val pSurface = Surface(st)
-            previewSurface = pSurface
+            val surfaces = mutableListOf<Surface>()
 
-            val r = ImageReader.newInstance(stillSize.width, stillSize.height, stillFormat, if (fusionMode) 7 else 2)
-            r.setOnImageAvailableListener({ rd -> if (fusionMode) onFusionImage(rd) else onPhoto(rd) }, camHandler)
-            reader = r
-
-            val outs = listOf(pSurface, r.surface).map { s ->
-                OutputConfiguration(s).also {
-                    if (physicalMode) it.setPhysicalCameraId(lens.physicalId)
+            if (videoMode) {
+                val want = if (v4k) Size(3840, 2160) else Size(1920, 1080)
+                val recSizes = map.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
+                val vs = if (recSizes.contains(want)) want else Size(1920, 1080)
+                if (vs != want) sessionNote += "\n4K no disponible en este lente: grabo en FHD"
+                var fps = if (v60) 60 else 30
+                val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
+                val minDur = try { map.getOutputMinFrameDuration(MediaRecorder::class.java, vs) } catch (_: Exception) { 0L }
+                if (fps == 60 && (minDur > 16_800_000L || ranges.none { it.upper >= 60 })) {
+                    fps = 30
+                    sessionNote += "\n60 fps no disponible en ${vs.height}p con este lente: grabo a 30"
                 }
+                videoSize = vs
+                videoFps = fps
+                fpsRange = ranges.firstOrNull { it.lower == fps && it.upper == fps }
+                    ?: ranges.filter { it.upper == fps }.maxByOrNull { it.lower }
+                    ?: Range(fps, fps)
+
+                val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), 16, 9, 1920) ?: vs
+                st.setDefaultBufferSize(prev.width, prev.height)
+                val ps = Surface(st)
+                previewSurface = ps
+                val rs = MediaCodec.createPersistentInputSurface()
+                createRecorder(rs, null).apply { prepare(); release() }
+                recSurface = rs
+                surfaces += ps
+                surfaces += rs
+            } else {
+                var fmt = if (singleUltraWanted()) ImageFormat.JPEG_R else ImageFormat.JPEG
+                var stillSize = pickSize(map.getOutputSizes(fmt), 4, 3, 4096)
+                if (stillSize == null && fmt == ImageFormat.JPEG_R) {
+                    fmt = ImageFormat.JPEG
+                    stillSize = pickSize(map.getOutputSizes(fmt), 4, 3, 4096)
+                    sessionNote += "\nEste lente no entrega Ultra HDR propio: guardo JPEG común"
+                }
+                stillIsUltra = fmt == ImageFormat.JPEG_R
+                val ss = stillSize!!
+                val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), 4, 3, 1440)!!
+                st.setDefaultBufferSize(prev.width, prev.height)
+                val ps = Surface(st)
+                previewSurface = ps
+                val r = ImageReader.newInstance(ss.width, ss.height, fmt, 8)
+                r.setOnImageAvailableListener({ rd -> onStill(rd) }, camHandler)
+                reader = r
+                surfaces += ps
+                surfaces += r.surface
+            }
+
+            val outs = surfaces.map { s ->
+                OutputConfiguration(s).also { if (usePhysical) it.setPhysicalCameraId(lens.physicalId) }
             }
             val cfg = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR, outs, executor,
@@ -592,11 +761,12 @@ class MainActivity : Activity() {
                         updatePreview()
                     }
                     override fun onConfigureFailed(s: CameraCaptureSession) {
-                        say("No se pudo configurar (${if (physicalMode) "modo físico" else "modo lógico"})")
+                        say("No se pudo configurar la sesión (${if (videoMode) "video ${videoSize.height}p $videoFps fps" else "foto"})")
                     }
                 }
             )
-            val sp = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            val sp = d.createCaptureRequest(repeatingTemplate())
+            if (videoMode) sp.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
             applyVendor(sp)
             cfg.setSessionParameters(sp.build())
             d.createCaptureSession(cfg)
@@ -605,10 +775,13 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun buildRequest(template: Int, target: Surface, allowScene: Boolean): CaptureRequest.Builder {
+    /** Una sola foto con el Ultra HDR del fabricante: solo cuando no hay fusión. */
+    private fun singleUltraWanted() = ultraHdr && hdrMode == 0 && !nightMode
+
+    private fun buildRequest(template: Int, targets: List<Surface>): CaptureRequest.Builder {
         val b = device!!.createCaptureRequest(template)
         val p = prof()
-        b.addTarget(target)
+        targets.forEach { b.addTarget(it) }
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         val fr = focusRegion
         if (fr != null) {
@@ -616,12 +789,16 @@ class MainActivity : Activity() {
             if (maxAfRegions > 0) b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(fr))
             if (maxAeRegions > 0) b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(fr))
         } else {
-            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            b.set(
+                CaptureRequest.CONTROL_AF_MODE,
+                if (videoMode) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            )
         }
         b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, p.exp)
         if (p.nr > 0) b.set(CaptureRequest.NOISE_REDUCTION_MODE, p.nr - 1)
         if (p.edge > 0) b.set(CaptureRequest.EDGE_MODE, p.edge - 1)
-        b.set(CaptureRequest.CONTROL_ZOOM_RATIO, if (physicalMode) 1f else lens.zoom)
+        b.set(CaptureRequest.CONTROL_ZOOM_RATIO, if (usePhysical || lens.front) 1f else lens.zoom)
+        if (videoMode) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
         applyVendor(b)
         return b
     }
@@ -630,6 +807,7 @@ class MainActivity : Activity() {
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
             res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastT = it }
             res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
+            if (riskySwitch != null && ++okFrames >= 30) { riskySwitch = null; riskyRevert = null }
             if (afWatching) {
                 when (res.get(CaptureResult.CONTROL_AF_STATE)) {
                     CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED -> {
@@ -644,21 +822,18 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            // Tras 30 frames sanos, la opción experimental se considera estable
-            if (riskySwitch != null && ++okFrames >= 30) { riskySwitch = null; riskyRevert = null }
         }
     }
 
     private fun updatePreview() {
         val s = session ?: return
-        val surf = previewSurface ?: return
+        if (previewSurface == null || device == null) return
         try {
-            val req = buildRequest(CameraDevice.TEMPLATE_PREVIEW, surf, !fusionMode).build()
+            val req = buildRequest(repeatingTemplate(), repeatingTargets()).build()
             s.setRepeatingRequest(req, previewCb, camHandler)
-            say("${lens.label} · ${if (physicalMode) "físico ${lens.physicalId}" else "lógico"}" +
-                " · HDR " + arrayOf("desactivado", "activo", "mejorado")[hdrMode] + vendorLog)
+            say(statusLine())
         } catch (e: Exception) {
-            say("Preview: ${e.javaClass.simpleName} ${e.message}")
+            say("Visor: ${e.javaClass.simpleName} ${e.message}")
         }
     }
 
@@ -680,24 +855,50 @@ class MainActivity : Activity() {
             if (on) log.append("\n$label: ${setVendor(b, key, 1)}")
         }
         go(vMfnr, "MFNR", q + "enableMFNR")
-        go(vMfhdr, "MFHDR", q + "EnableMFHDR")
         go(vShdr, "SHDR", q + "EnableSHDR")
         go(vZsl, "ZSL Moto", m + "control.capture_zsl_mode")
         go(vMoto, "Cliente Moto", m + "clientapp.is_motcamera2")
         vendorLog = log.toString()
     }
 
-    // ------------------------------------------------------------------ captura simple (JPEG_R)
+    // ------------------------------------------------------------------ disparador
 
-    private fun takePhoto() {
-        if (fusionMode) { takeFusion(); return }
+    private fun onShutter() {
+        if (videoMode) {
+            camHandler.post { if (recording) stopRecording() else startRecording() }
+            return
+        }
+        if (merger != null) { say("Todavía estoy procesando la foto anterior..."); return }
+        when {
+            nightMode -> startMerge(nightFrames, true)
+            hdrMode == 1 -> startMerge(8, false)
+            hdrMode == 2 -> startMerge(15, false)
+            else -> takeSingle()
+        }
+    }
+
+    private fun onStill(rd: ImageReader) {
+        val img = rd.acquireNextImage() ?: return
+        val bytes = try {
+            val buf = img.planes[0].buffer
+            ByteArray(buf.remaining()).also { buf.get(it) }
+        } finally {
+            img.close()
+        }
+        val m = merger
+        if (m != null && m.accepting()) m.offer(bytes) else onSinglePhoto(bytes)
+    }
+
+    // ------------------------------------------------------------------ foto simple
+
+    private fun takeSingle() {
         val s = session ?: return say("Cámara no lista")
         val r = reader ?: return say("Cámara no lista")
         try {
             pendingLens = lens
             pendingHdr = prof().hdr
-            pendingMode = hdrMode
-            val b = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, r.surface, true)
+            pendingUltra = stillIsUltra
+            val b = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(r.surface))
             b.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
             b.set(CaptureRequest.JPEG_QUALITY, 97.toByte())
             s.capture(b.build(), null, camHandler)
@@ -707,44 +908,35 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun onPhoto(rd: ImageReader) {
-        val img = rd.acquireNextImage() ?: return
-        val bytes = try {
-            val buf = img.planes[0].buffer
-            ByteArray(buf.remaining()).also { buf.get(it) }
-        } finally {
-            img.close()
-        }
-        val hdr = pendingHdr
-        if (pendingMode == 0) {
-            val n = "IMG_${stamp()}_${pendingLens.name}"
-            saveFile(bytes, "$n.jpg")
-            say("Guardada: $n.jpg (sin HDR)")
+    private fun onSinglePhoto(bytes: ByteArray) {
+        val base = "IMG_${stamp()}_${pendingLens.name}"
+        if (!pendingUltra) {
+            saveImage(bytes, "$base.jpg")
+            say("Guardada: $base.jpg (una foto, sin HDR)")
             return
         }
-        val name = "UHDR_${stamp()}_${pendingLens.name}"
+        val hdr = pendingHdr
         if (hdr == 100) {
-            saveFile(bytes, "$name.jpg")
-            say("Guardada: $name.jpg")
+            saveImage(bytes, "${base}_UHDR.jpg")
+            say("Guardada: ${base}_UHDR.jpg (Ultra HDR del fabricante)")
             return
         }
         val adjusted = try { adjustGainmap(bytes, hdr / 100f) } catch (e: Throwable) { null }
         if (adjusted != null) {
-            saveFile(adjusted, "${name}_hdr$hdr.jpg")
-            say("Guardada con HDR al $hdr%")
+            saveImage(adjusted, "${base}_UHDR$hdr.jpg")
+            say("Guardada con Ultra HDR al $hdr%")
         } else {
-            saveFile(bytes, "$name.jpg")
+            saveImage(bytes, "${base}_UHDR.jpg")
             say("Guardada la original. El ajuste del gain map falló en este equipo.")
         }
     }
 
     private fun stamp() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
-    /** Escala el efecto HDR del gain map del fabricante (k=0 sin HDR, 1 igual, >1 más fuerte). */
+    /** Escala el efecto del gain map del fabricante (k=0 sin HDR, 1 igual, >1 más fuerte). */
     private fun adjustGainmap(src: ByteArray, k: Float): ByteArray? {
         val bmp = BitmapFactory.decodeByteArray(src, 0, src.size) ?: return null
         val gm = bmp.gainmap ?: return null
-
         val mx = gm.ratioMax
         val mn = gm.ratioMin
         gm.setRatioMax(mx[0].pow(k), mx[1].pow(k), mx[2].pow(k))
@@ -765,208 +957,384 @@ class MainActivity : Activity() {
         return if (check != null && check.hasGainmap()) result else null
     }
 
-    // ------------------------------------------------------------------ fusión por ráfaga
+    // ------------------------------------------------------------------ fusión (HDR activo / mejorado / noche)
 
     /**
-     * Ráfaga de 3 exposiciones manuales: la medida por el visor (0 EV), -2 EV y -4 EV.
-     * El frame base queda como imagen SDR; los oscuros recuperan las altas luces y con ellos
-     * calculamos nosotros el gain map (Ultra HDR).
+     * Ráfaga de N fotos idénticas y subexpuestas (estilo HDR+ de la GCam). Al promediarlas baja el ruido,
+     * lo que permite subexponer para proteger las luces altas y después levantar las sombras.
      */
-    private fun takeFusion() {
+    private fun startMerge(n: Int, night: Boolean) {
         val s = session ?: return say("Cámara no lista")
         val r = reader ?: return say("Cámara no lista")
         val t0 = lastT
         val iso0 = lastIso
         if (t0 <= 0L || iso0 <= 0) return say("Esperá un segundo a que el visor mida la exposición")
         try {
-            synchronized(fuseLock) {
-                fuseImgCount = 0; fuseResCount = 0
-                for (i in 0..4) { fuseImgs[i] = null; fuseP[i] = 0.0 }
-                fuseTotal = burstN
-            }
-            pendingLens = lens
-            pendingHdr = prof().hdr
+            val u = hlSteps / 3f
+            // Noche: +1 EV extra sobre lo que mide el visor, que en la oscuridad se queda corto
+            val boost = if (night) 1.0 else 0.0
+            val p = t0.toDouble() * iso0 * 2.0.pow(boost - u)
+            val tMax = if (night) 125_000_000L else 33_000_000L
+            val t = (p / isoMin).toLong().coerceAtMost(tMax).coerceIn(expMin, expMax)
+            val iso = (p / t).roundToInt().coerceIn(isoMin, isoMax)
 
-            val evs = if (burstN == 5) floatArrayOf(0f, -1f, -2f, -3f, -4f) else floatArrayOf(0f, -2f, -4f)
-            val reqs = evs.mapIndexed { i, ev ->
-                val targetP = t0.toDouble() * iso0 * 2.0.pow(ev.toDouble())
-                val t = (targetP / iso0).toLong().coerceIn(expMin, expMax)
-                val iso = (targetP / t).roundToInt().coerceIn(isoMin, isoMax)
-                val b = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, r.surface, false)
+            pendingLens = lens
+            val tag = if (night) "NOCHE" else if (hdrMode == 2) "HDRM" else "HDR"
+            val m = Merger(n, u, night, ultraHdr, prof().hdr / 100f, tag, lens.name)
+            merger = m
+
+            val reqs = List(n) {
+                val b = buildRequest(CameraDevice.TEMPLATE_STILL_CAPTURE, listOf(r.surface))
                 b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                 b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, t)
                 b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
                 b.set(CaptureRequest.SENSOR_FRAME_DURATION, max(t, 33_333_333L))
-                b.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
-                b.set(CaptureRequest.JPEG_QUALITY, 97.toByte())
-                b.setTag(i)
+                b.set(CaptureRequest.JPEG_ORIENTATION, 0)
+                b.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
                 b.build()
             }
-            val cb = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(ses: CameraCaptureSession, req: CaptureRequest, res: TotalCaptureResult) {
-                    val i = req.tag as Int
-                    val t = res.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
-                    val iso = res.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
-                    synchronized(fuseLock) {
-                        fuseP[i] = t.toDouble() * iso
-                        fuseResCount++
-                        maybeFuse()
-                    }
-                }
+            s.captureBurst(reqs, object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureFailed(ses: CameraCaptureSession, req: CaptureRequest, f: CaptureFailure) {
-                    say("Falló un frame de la ráfaga")
+                    m.frameFailed()
                 }
-            }
-            s.captureBurst(reqs, cb, camHandler)
-            say("Ráfaga en curso, mantené quieto el celu...")
+            }, camHandler)
+            // Red de seguridad: si algún cuadro nunca llega, fusiona con los que haya
+            val waitMs = n * (max(t, 33_333_333L) / 1_000_000L + 400L) + 6_000L
+            camHandler.postDelayed({ if (merger === m) m.forceFinish() }, waitMs)
+            say("Toma de $n fotos (1/${(1e9 / t).roundToInt()} s, ISO $iso). Mantené quieto el celu...")
         } catch (e: Exception) {
+            merger = null
             say("Ráfaga: ${e.javaClass.simpleName} ${e.message}")
         }
     }
 
-    private fun onFusionImage(rd: ImageReader) {
-        val img = rd.acquireNextImage() ?: return
-        val bytes = try {
-            val buf = img.planes[0].buffer
-            ByteArray(buf.remaining()).also { buf.get(it) }
-        } finally {
-            img.close()
-        }
-        synchronized(fuseLock) {
-            if (fuseImgCount < fuseTotal) {
-                fuseImgs[fuseImgCount] = bytes
-                fuseImgCount++
-            }
-            maybeFuse()
-        }
-    }
+    private inner class Merger(
+        val total: Int,
+        val u: Float,
+        val night: Boolean,
+        val makeGain: Boolean,
+        val k: Float,
+        val tag: String,
+        val lensName: String
+    ) {
+        @Volatile private var received = 0
+        @Volatile private var expected = total
+        @Volatile private var finished = false
+        private var processed = 0
+        private var merged = 0
 
-    /** Se llama con fuseLock tomado. Cuando están todos los frames y todos los resultados, procesa en otro hilo. */
-    private fun maybeFuse() {
-        if (fuseImgCount < fuseTotal || fuseResCount < fuseTotal) return
-        val n = fuseTotal
-        val frames = Array(n) { fuseImgs[it]!! }
-        val p = fuseP.copyOf(n)
-        val tag = pendingLens.name
-        val hdr = pendingHdr
-        fuseImgCount = 0
-        fuseResCount = 0
-        Thread {
-            say("Fusionando...")
-            val name = "UHDRFUS_${stamp()}_$tag"
+        // Solo se tocan desde mergeExec
+        private var w = 0
+        private var h = 0
+        private var sumR: ShortArray? = null
+        private var sumG: ShortArray? = null
+        private var sumB: ShortArray? = null
+        private var cnt: ByteArray? = null
+        private var refL: ByteArray? = null
+        private var refBits: ByteArray? = null
+        private var refMask: ByteArray? = null
+        private var sw = 0
+        private var sh = 0
+
+        fun accepting() = !finished && received < expected
+
+        fun offer(bytes: ByteArray) {
+            received++
+            val got = received
+            say("Capturando $got/$total... mantené quieto el celu")
+            mergeExec.execute {
+                try { add(bytes) } catch (_: Throwable) {}
+                processed++
+                checkDone()
+            }
+        }
+
+        fun frameFailed() {
+            expected--
+            mergeExec.execute { checkDone() }
+        }
+
+        fun forceFinish() {
+            expected = received
+            mergeExec.execute { checkDone() }
+        }
+
+        private fun checkDone() {
+            if (finished || processed < expected || received < expected) return
+            finished = true
+            finish()
+        }
+
+        private fun add(bytes: ByteArray) {
+            // Alineación: mapa a 1/4 de resolución
+            val small = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 4 }) ?: return
+            val code = lumaCode(small)
+            val smw = small.width
+            val smh = small.height
+            small.recycle()
+            var dx = 0
+            var dy = 0
+            val th = median(code)
+            if (refBits == null) {
+                sw = smw; sh = smh
+                refBits = mtb(code, th)
+                refMask = mtbMask(code, th)
+            } else {
+                if (smw != sw || smh != sh) return
+                val sft = estimateShift(refBits!!, refMask!!, mtb(code, th), mtbMask(code, th), sw, sh)
+                dx = sft[0] * 4
+                dy = sft[1] * 4
+            }
+
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
+            if (sumR == null) {
+                w = bmp.width; h = bmp.height
+                val n = w * h
+                sumR = ShortArray(n); sumG = ShortArray(n); sumB = ShortArray(n)
+                cnt = ByteArray(n); refL = ByteArray(n)
+            } else if (bmp.width != w || bmp.height != h) {
+                bmp.recycle(); return
+            }
+            val sr = sumR!!; val sg = sumG!!; val sb = sumB!!; val c = cnt!!; val rl = refL!!
+            val first = merged == 0
+            val thr = if (night) 48 else 36
+            val row = IntArray(w)
+            for (y in 0 until h) {
+                val yy = (y + dy).coerceIn(0, h - 1)
+                bmp.getPixels(row, 0, w, 0, yy, w, 1)
+                val base = y * w
+                for (x in 0 until w) {
+                    val px = row[(x + dx).coerceIn(0, w - 1)]
+                    val r = (px shr 16) and 255
+                    val g = (px shr 8) and 255
+                    val b = px and 255
+                    val l = (r + 2 * g + b) shr 2
+                    val i = base + x
+                    if (first) {
+                        rl[i] = l.toByte()
+                    } else if (abs(l - (rl[i].toInt() and 255)) > thr) {
+                        continue // algo se movió: no se mezcla este punto (evita fantasmas)
+                    }
+                    sr[i] = (sr[i] + r).toShort()
+                    sg[i] = (sg[i] + g).toShort()
+                    sb[i] = (sb[i] + b).toShort()
+                    c[i] = (c[i] + 1).toByte()
+                }
+            }
+            bmp.recycle()
+            merged++
+        }
+
+        private fun finish() {
+            val name = "IMG_${stamp()}_${lensName}_$tag"
             try {
-                val out = fuseToUltraHdr(frames, p, hdr / 100f)
-                if (out != null) {
-                    saveFile(out, "$name.jpg")
-                    say("Fusión lista: $name.jpg")
-                } else {
-                    saveFile(frames[0], "${name}_base.jpg")
-                    say("La fusión falló; guardé solo el frame base (sin Ultra HDR)")
-                }
+                if (merged == 0) { say("No llegó ninguna foto de la ráfaga"); return }
+                say("Fusionando $merged fotos...")
+                val out = render()
+                saveImage(out, "$name.jpg")
+                say("Guardada: $name.jpg ($merged fotos fusionadas)")
             } catch (t: Throwable) {
-                saveFile(frames[0], "${name}_base.jpg")
-                say("Fusión: ${t.javaClass.simpleName} ${t.message}. Guardé el frame base.")
+                say("Fusión: ${t.javaClass.simpleName} ${t.message}")
+            } finally {
+                sumR = null; sumG = null; sumB = null; cnt = null; refL = null
+                if (merger === this) merger = null
             }
-        }.start()
+        }
+
+        /** Curva de tono: levanta las sombras por g = 2^u y comprime las luces (Reinhard extendido). */
+        private fun tone(lin: Float, g: Float): Float {
+            val x = lin * g
+            return x * (1f + x / (g * g)) / (1f + x)
+        }
+
+        private fun render(): ByteArray {
+            val g = 2f.pow(u)
+            val sr = sumR!!; val sg = sumG!!; val sb = sumB!!; val c = cnt!!
+            val lutSize = 255 * 16 + 1
+            val linLut = FloatArray(lutSize)
+            val toneLut = IntArray(lutSize)
+            for (i in 0 until lutSize) {
+                val code = i / (255f * 16f)
+                val lin = srgbToLin(code)
+                linLut[i] = lin
+                toneLut[i] = (linToSrgb(tone(lin, g)) * 255f + 0.5f).toInt().coerceIn(0, 255)
+            }
+            fun idx(sum: Short, n: Int) = ((sum.toInt() * 16) / n).coerceIn(0, lutSize - 1)
+
+            // Gain map a 1/4 de resolución: cuánto más brilla la escena real que la versión SDR
+            val wantGain = makeGain && g > 1.01f
+            val gw = w / 4
+            val gh = h / 4
+            var gmBytes: ByteArray? = null
+            if (wantGain) {
+                val eps = 1f / 64f
+                val log2g = ln(g.toDouble()).toFloat() / ln(2f)
+                val lg = FloatArray(gw * gh)
+                for (by in 0 until gh) for (bx in 0 until gw) {
+                    var acc = 0f
+                    for (yy in 0 until 4) for (xx in 0 until 4) {
+                        val i = (by * 4 + yy) * w + bx * 4 + xx
+                        val n = (c[i].toInt() and 255).coerceAtLeast(1)
+                        acc += 0.2126f * linLut[idx(sr[i], n)] + 0.7152f * linLut[idx(sg[i], n)] + 0.0722f * linLut[idx(sb[i], n)]
+                    }
+                    val lin = acc / 16f
+                    val hdr = lin * g
+                    val sdr = tone(lin, g)
+                    val gain = (hdr + eps) / (sdr + eps)
+                    lg[by * gw + bx] = ((ln(gain.toDouble()).toFloat() / ln(2f)) / log2g).coerceIn(0f, 1f)
+                }
+                val bl = boxBlur(lg, gw, gh, 1)
+                gmBytes = ByteArray(gw * gh) { (bl[it] * 255f).roundToInt().coerceIn(0, 255).toByte() }
+            }
+
+            // Imagen SDR
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val row = IntArray(w)
+            for (y in 0 until h) {
+                val base = y * w
+                for (x in 0 until w) {
+                    val i = base + x
+                    val n = (c[i].toInt() and 255).coerceAtLeast(1)
+                    row[x] = (0xFF shl 24) or (toneLut[idx(sr[i], n)] shl 16) or
+                        (toneLut[idx(sg[i], n)] shl 8) or toneLut[idx(sb[i], n)]
+                }
+                bmp.setPixels(row, 0, w, 0, y, w, 1)
+            }
+            sumR = null; sumG = null; sumB = null; cnt = null; refL = null
+
+            val rot = if (w > h) sensorOrientation else 0
+            val out = if (rot != 0) {
+                val m = Matrix().apply { postRotate(rot.toFloat()) }
+                Bitmap.createBitmap(bmp, 0, 0, w, h, m, true).also { bmp.recycle() }
+            } else bmp
+
+            val gm = gmBytes
+            if (gm != null) {
+                val rk = g.pow(k)
+                if (rk > 1.01f) {
+                    val (rb, rw, rh) = rotateBytes(gm, gw, gh, rot)
+                    val gbmp = Bitmap.createBitmap(rw, rh, Bitmap.Config.ALPHA_8)
+                    gbmp.copyPixelsFromBuffer(ByteBuffer.wrap(rb))
+                    val eps = 1f / 64f
+                    val gain = Gainmap(gbmp)
+                    gain.setRatioMin(1f, 1f, 1f)
+                    gain.setRatioMax(rk, rk, rk)
+                    gain.setGamma(1f, 1f, 1f)
+                    gain.setEpsilonSdr(eps, eps, eps)
+                    gain.setEpsilonHdr(eps, eps, eps)
+                    gain.setDisplayRatioForFullHdr(max(rk, 1.5f))
+                    gain.setMinDisplayRatioForHdrTransition(1f)
+                    out.setGainmap(gain)
+                }
+            }
+
+            val bos = ByteArrayOutputStream()
+            out.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+            out.recycle()
+            return bos.toByteArray()
+        }
     }
 
-    private fun fuseToUltraHdr(frames: Array<ByteArray>, p: DoubleArray, k: Float): ByteArray? {
-        if (p.any { it <= 0.0 }) return null
+    // ------------------------------------------------------------------ video
 
-        // 1) Versiones reducidas (1/4) para calcular el gain map
-        val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
-        val small = frames.map { BitmapFactory.decodeByteArray(it, 0, it.size, opts) ?: return null }
-        val w = small[0].width
-        val h = small[0].height
-        if (small.any { it.width != w || it.height != h }) return null
-        val luma = small.map { toLuma(it) }
-        small.forEach { it.recycle() }
+    private fun videoBitrate() = when {
+        videoSize.width >= 3840 && videoFps >= 60 -> 80_000_000
+        videoSize.width >= 3840 -> 50_000_000
+        videoFps >= 60 -> 30_000_000
+        else -> 18_000_000
+    }
 
-        // 2) Alineación global (traslación) de los frames oscuros contra el base
-        val th = luma.map { median(it.code) }
-        val bits = luma.mapIndexed { i, l -> mtb(l.code, th[i]) }
-        val mask = luma.mapIndexed { i, l -> mtbMask(l.code, th[i]) }
-        val nf = frames.size
-        val dx = IntArray(nf)
-        val dy = IntArray(nf)
-        for (f in 1 until nf) {
-            val s = estimateShift(bits[0], mask[0], bits[f], mask[f], w, h)
-            dx[f] = s[0]; dy[f] = s[1]
-        }
-
-        // 3) Fusión de radiancia y gain map (en log2)
-        val eps = 1f / 64f
-        val e = DoubleArray(nf) { p[it] / p[0] }
-        val n = w * h
-        val lg = FloatArray(n)
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val i = y * w + x
-                var num = 0.0
-                var den = 0.0
-                for (f in 0 until nf) {
-                    val xx = (x + dx[f]).coerceIn(0, w - 1)
-                    val yy = (y + dy[f]).coerceIn(0, h - 1)
-                    val j = yy * w + xx
-                    val c = luma[f].code[j]
-                    val wt = max(1f - abs(2f * c - 1f), 0.01f).toDouble()
-                    num += wt * luma[f].lin[j] / e[f]
-                    den += wt
-                }
-                val sdr = luma[0].lin[i]
-                val r = if (den > 1e-6) (num / den).toFloat() else sdr
-                val g = (r + eps) / (sdr + eps)
-                val m = smoothstep(0.5f, 0.85f, luma[0].code[i])
-                val gain = max(1f + m * (g - 1f), 1f)
-                lg[i] = (ln(gain.toDouble()) / ln(2.0)).toFloat()
+    private fun createRecorder(surface: Surface, fd: FileDescriptor?): MediaRecorder {
+        val audio = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        return MediaRecorder(this).apply {
+            if (audio) setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            if (fd != null) setOutputFile(fd) else setOutputFile(File(cacheDir, "dummy.mp4"))
+            setVideoEncodingBitRate(videoBitrate())
+            setVideoFrameRate(videoFps)
+            setVideoSize(videoSize.width, videoSize.height)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            if (audio) {
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioSamplingRate(48_000)
+                setAudioEncodingBitRate(192_000)
+                setAudioChannels(2)
             }
+            setInputSurface(surface)
+            setOrientationHint(sensorOrientation)
         }
-        val blurred = boxBlur(lg, w, h, 2)
+    }
 
-        // 4) Normalización: ratio máximo = percentil 99.8 de la ganancia, entre 1.5x y 16x
-        val sorted = blurred.copyOf().also { it.sort() }
-        val maxLog = sorted[(n * 0.998f).toInt().coerceIn(0, n - 1)].coerceIn(0.585f, 4f) // 2^0.585 = 1.5x
-        val ratioMax = 2f.pow(maxLog)
-        val gmBytes = ByteArray(n) { i -> ((blurred[i] / maxLog).coerceIn(0f, 1f) * 255f).roundToInt().toByte() }
+    /** Se llama en camHandler. */
+    private fun startRecording() {
+        if (session == null || recSurface == null) return say("Cámara no lista para video")
+        val rs = recSurface!!
+        var uri: Uri? = null
+        var pfd: ParcelFileDescriptor? = null
+        try {
+            val v = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, "VID_${stamp()}.mp4")
+                put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "DCIM/Camera")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+                put(MediaStore.MediaColumns.DATE_TAKEN, System.currentTimeMillis())
+            }
+            uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)
+                ?: return say("No pude crear el archivo de video")
+            pfd = contentResolver.openFileDescriptor(uri, "w") ?: throw IllegalStateException("sin descriptor")
+            val rec = createRecorder(rs, pfd.fileDescriptor)
+            rec.prepare()
+            recording = true
+            updatePreview()
+            rec.start()
+            recorder = rec
+            recPfd = pfd
+            recUri = uri
+            runOnUiThread { updateShutter() }
+        } catch (e: Exception) {
+            recording = false
+            try { pfd?.close() } catch (_: Exception) {}
+            uri?.let { try { contentResolver.delete(it, null, null) } catch (_: Exception) {} }
+            updatePreview()
+            runOnUiThread { updateShutter() }
+            say("Video: ${e.javaClass.simpleName} ${e.message}")
+        }
+    }
 
-        // 5) Imagen base a resolución completa + rotación
-        val baseOpts = BitmapFactory.Options().apply { inMutable = true }
-        val base0 = BitmapFactory.decodeByteArray(frames[0], 0, frames[0].size, baseOpts) ?: return null
-        val rot = if (sensorOrientation % 180 != 0 && base0.width > base0.height) sensorOrientation else 0
-        val base = if (rot != 0) {
-            val m = Matrix().apply { postRotate(rot.toFloat()) }
-            Bitmap.createBitmap(base0, 0, 0, base0.width, base0.height, m, true).also { base0.recycle() }
-        } else base0
-
-        val (rotBytes, gw, gh) = rotateBytes(gmBytes, w, h, rot)
-        val gbmp = Bitmap.createBitmap(gw, gh, Bitmap.Config.ALPHA_8)
-        gbmp.copyPixelsFromBuffer(ByteBuffer.wrap(rotBytes))
-
-        val rk = ratioMax.pow(k).coerceAtLeast(1.01f)
-        val gm = Gainmap(gbmp)
-        gm.setRatioMin(1f, 1f, 1f)
-        gm.setRatioMax(rk, rk, rk)
-        gm.setGamma(1f, 1f, 1f)
-        gm.setEpsilonSdr(eps, eps, eps)
-        gm.setEpsilonHdr(eps, eps, eps)
-        gm.setDisplayRatioForFullHdr(max(rk, 1.5f))
-        gm.setMinDisplayRatioForHdrTransition(1f)
-        base.setGainmap(gm)
-
-        val bos = ByteArrayOutputStream()
-        base.compress(Bitmap.CompressFormat.JPEG, 96, bos)
-        val result = bos.toByteArray()
-        val check = BitmapFactory.decodeByteArray(result, 0, result.size)
-        return if (check != null && check.hasGainmap()) result else null
+    private fun stopRecording() {
+        if (!recording) return
+        recording = false
+        val rec = recorder
+        recorder = null
+        var ok = rec != null
+        try { rec?.stop() } catch (_: RuntimeException) { ok = false }
+        try { rec?.release() } catch (_: Exception) {}
+        try { recPfd?.close() } catch (_: Exception) {}
+        recPfd = null
+        recUri?.let { uri ->
+            try {
+                if (ok) {
+                    contentResolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+                } else {
+                    contentResolver.delete(uri, null, null)
+                }
+            } catch (_: Exception) {}
+        }
+        recUri = null
+        updatePreview()
+        runOnUiThread { updateShutter() }
+        say(if (ok) "Video guardado en DCIM/Camera" else "El video quedó vacío y se descartó")
     }
 
     // ------------------------------------------------------------------ guardado
 
-    private fun saveFile(bytes: ByteArray, name: String) {
+    private fun saveImage(bytes: ByteArray, name: String) {
         val v = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, name)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "DCIM/Camera")
+            put(MediaStore.MediaColumns.DATE_TAKEN, System.currentTimeMillis())
         }
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: return
         contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
@@ -975,34 +1343,23 @@ class MainActivity : Activity() {
 
 // ---------------------------------------------------------------------- utilidades de imagen
 
-private class Luma(val code: FloatArray, val lin: FloatArray)
-
-private val SRGB_LUT = FloatArray(256) { i ->
-    val c = i / 255f
+private fun srgbToLin(c: Float): Float =
     if (c <= 0.04045f) c / 12.92f else ((c + 0.055f) / 1.055f).pow(2.4f)
+
+private fun linToSrgb(l: Float): Float {
+    val x = l.coerceIn(0f, 1f)
+    return if (x <= 0.0031308f) x * 12.92f else 1.055f * x.pow(1f / 2.4f) - 0.055f
 }
 
-private fun toLuma(bmp: Bitmap): Luma {
+private fun lumaCode(bmp: Bitmap): FloatArray {
     val w = bmp.width
     val h = bmp.height
     val px = IntArray(w * h)
     bmp.getPixels(px, 0, w, 0, 0, w, h)
-    val code = FloatArray(w * h)
-    val lin = FloatArray(w * h)
-    for (i in px.indices) {
+    return FloatArray(w * h) { i ->
         val p = px[i]
-        val r = (p shr 16) and 255
-        val g = (p shr 8) and 255
-        val b = p and 255
-        code[i] = (0.2126f * r + 0.7152f * g + 0.0722f * b) / 255f
-        lin[i] = 0.2126f * SRGB_LUT[r] + 0.7152f * SRGB_LUT[g] + 0.0722f * SRGB_LUT[b]
+        (0.2126f * ((p shr 16) and 255) + 0.7152f * ((p shr 8) and 255) + 0.0722f * (p and 255)) / 255f
     }
-    return Luma(code, lin)
-}
-
-private fun smoothstep(a: Float, b: Float, x: Float): Float {
-    val t = ((x - a) / (b - a)).coerceIn(0f, 1f)
-    return t * t * (3f - 2f * t)
 }
 
 private fun median(a: FloatArray): Float {
@@ -1022,7 +1379,8 @@ private fun mtbMask(a: FloatArray, th: Float) = ByteArray(a.size) { if (abs(a[it
 
 /** Busca la traslación (dx, dy) que mejor alinea img con ref, con bitmaps de umbral por mediana. */
 private fun estimateShift(refB: ByteArray, refM: ByteArray, imgB: ByteArray, imgM: ByteArray, w: Int, h: Int): IntArray {
-    val range = 12
+    val range = 10
+    val step = 3
     var best = Int.MAX_VALUE
     var bx = 0
     var by = 0
@@ -1036,9 +1394,9 @@ private fun estimateShift(refB: ByteArray, refM: ByteArray, imgB: ByteArray, img
                     val i = y * w + x
                     val j = (y + dy) * w + (x + dx)
                     if (refM[i].toInt() == 1 && imgM[j].toInt() == 1 && refB[i] != imgB[j]) err++
-                    x += 2
+                    x += step
                 }
-                y += 2
+                y += step
             }
             if (err < best) { best = err; bx = dx; by = dy }
         }
